@@ -37,7 +37,11 @@ type Field struct {
 
 // Event accumulates the fields of one unit of work and emits them once. Setting a key again replaces its
 // value; fields keep the order in which their keys were first set. All methods are safe for concurrent use
-// and do nothing on a nil *Event. After Emit the event is frozen: later writes are dropped.
+// and do nothing on a nil *Event. After Emit the event is frozen: later writes are dropped, so work that
+// outlives the unit of work needs its own event.
+//
+// Reserved keys: the key segment "_value" holds the value of a key that is also a prefix of other keys
+// (see FieldsMap), and the JSON emitter writes the root keys "level" and "message" itself.
 type Event struct {
 	mutex     sync.Mutex
 	values    map[string]any

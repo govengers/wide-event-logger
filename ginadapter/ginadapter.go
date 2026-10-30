@@ -3,6 +3,7 @@
 package ginadapter
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -30,9 +31,19 @@ const ginContextKey = "wideevent"
 
 // Limits on client-controlled text, so a request cannot inflate its event.
 const (
-	maximumRequestIDLength = 128
-	maximumQueryBytes      = 512
-	maximumUserAgentBytes  = 512
+	maximumRequestIDLength  = 128
+	maximumMethodBytes      = 32
+	maximumHostBytes        = 256
+	maximumPathBytes        = 2048
+	maximumParsedQueryBytes = 4096 // the raw query is cut before parsing, bounding the work for huge queries
+	maximumQueryBytes       = 512
+	maximumUserAgentBytes   = 512
+)
+
+// The printable ASCII range a client's request ID must stay in: no spaces, no control characters.
+const (
+	firstPrintableASCII = '!'
+	lastPrintableASCII  = '~'
 )
 
 // Enricher adds fields to the request event before or after the handler runs.
@@ -62,15 +73,26 @@ type middleware struct {
 	postEnricher   Enricher
 }
 
+// ownedEventKey marks the event this middleware started for a request, so engine.HandleContext, which
+// runs the middleware again for the same request, keeps that event instead of starting a second one.
+type ownedEventKey struct{}
+
 // NewMiddleware returns a Gin middleware that starts a wide event named "http.request" per request,
-// records the request and response, and emits the event when the handler returns, unless the handler
-// emitted it already. A panicking handler is recorded as a failure with status 500 and the panic is
-// raised again for an outer gin.Recovery. It returns an error when options or its Emitter is nil.
+// records the request and response, and emits the event when the handler returns. A panic in the
+// handler or an enricher is recorded as a failure with status 500 and raised again for an outer
+// gin.Recovery. It returns an error when options or its Emitter is nil.
 //
 // Recorded fields: request.method, path, query (redacted, see Options.QueryAllowlist), host, proto,
 // content_length, client_ip, user_agent, id, start_time; response.status, body_size, gin_errors; and the
-// event's duration. request.id is the client's X-Request-ID when it is printable ASCII of at most 128
-// characters, otherwise a generated one; it is echoed in the X-Request-ID response header.
+// event's duration. Client-controlled text is cut to a few hundred bytes (path: 2048). request.id is the
+// client's X-Request-ID when it is printable ASCII of at most 128 characters, otherwise a generated one;
+// it is echoed in the X-Request-ID response header. request.client_ip follows Gin's trusted proxy
+// settings (engine.SetTrustedProxies).
+//
+// Handlers must not call Emit on the request event: an early Emit freezes it before the response fields
+// are recorded, and the middleware's own Emit becomes a no-op. Requests Gin answers before running any
+// middleware, such as its automatic trailing-slash redirects, produce no event; Gin's default 404 and 405
+// bodies are written after the event, which records their body_size as 0.
 func NewMiddleware(options *Options) (gin.HandlerFunc, error) {
 	if options == nil || options.Emitter == nil {
 		return nil, errors.New("wide event middleware: Emitter is required")
@@ -101,16 +123,22 @@ func (m *middleware) handle(ginContext *gin.Context) {
 		ginContext.Next()
 		return
 	}
+	if owned, isEvent := ginContext.Request.Context().Value(ownedEventKey{}).(*wideevent.Event); isEvent {
+		ginContext.Set(ginContextKey, owned) // engine.HandleContext cleared the key store; the outer run emits
+		ginContext.Next()
+		return
+	}
 
 	we := wideevent.Begin(m.emitter, requestEventName)
+	defer m.finish(we, ginContext) // first, so a panicking pre-enricher still produces the event
+
+	ctx := context.WithValue(wideevent.NewContext(ginContext.Request.Context(), we), ownedEventKey{}, we)
+	ginContext.Request = ginContext.Request.WithContext(ctx)
 	ginContext.Set(ginContextKey, we)
-	ginContext.Request = ginContext.Request.WithContext(wideevent.NewContext(ginContext.Request.Context(), we))
 	m.recordRequest(we, ginContext)
 	if m.preEnricher != nil {
 		m.preEnricher(we, ginContext)
 	}
-
-	defer m.finish(we, ginContext)
 	ginContext.Next()
 }
 
@@ -119,10 +147,12 @@ func (m *middleware) recordRequest(we *wideevent.Event, ginContext *gin.Context)
 	id := requestID(request.Header.Get(RequestIDHeader))
 	ginContext.Header(RequestIDHeader, id)
 
-	we.Str(wideevent.KeyRequestMethod, request.Method).
-		Str(wideevent.KeyRequestPath, request.URL.Path).
-		Str("request.query", redactQuery(request.URL.Query(), m.queryAllowlist)).
-		Str("request.host", request.Host).
+	// ParseQuery keeps the valid pairs of a malformed query, like URL.Query.
+	query, _ := url.ParseQuery(truncate(request.URL.RawQuery, maximumParsedQueryBytes))
+	we.Str(wideevent.KeyRequestMethod, truncate(request.Method, maximumMethodBytes)).
+		Str(wideevent.KeyRequestPath, truncate(request.URL.Path, maximumPathBytes)).
+		Str("request.query", redactQuery(query, m.queryAllowlist)).
+		Str("request.host", truncate(request.Host, maximumHostBytes)).
 		Str("request.proto", request.Proto).
 		Int64("request.content_length", request.ContentLength).
 		Str("request.client_ip", ginContext.ClientIP()).
@@ -131,10 +161,21 @@ func (m *middleware) recordRequest(we *wideevent.Event, ginContext *gin.Context)
 		Time("request.start_time", time.Now())
 }
 
-// finish records the response and emits the event. It is deferred, so a panicking handler still
-// produces an event; the panic is raised again afterwards.
+// finish records the response and emits the event. It is deferred, so a panic in the handler or an
+// enricher still produces the event; the first panic is raised again afterwards.
 func (m *middleware) finish(we *wideevent.Event, ginContext *gin.Context) {
 	recovered := recover()
+	defer func() {
+		if finishPanic := recover(); finishPanic != nil && recovered == nil {
+			recovered = finishPanic
+			we.Failure(fmt.Errorf("panic: %v", finishPanic))
+		}
+		we.Emit()
+		if recovered != nil {
+			panic(recovered)
+		}
+	}()
+
 	status := ginContext.Writer.Status()
 	if recovered != nil {
 		we.Failure(fmt.Errorf("panic: %v", recovered))
@@ -142,34 +183,40 @@ func (m *middleware) finish(we *wideevent.Event, ginContext *gin.Context) {
 			status = http.StatusInternalServerError
 		}
 	}
-
 	// Gin reports -1 when the handler wrote no body.
 	we.Int(wideevent.KeyResponseStatus, status).Int("response.body_size", max(ginContext.Writer.Size(), 0))
 	if len(ginContext.Errors) > 0 {
-		we.Set("response.gin_errors", ginContext.Errors.Errors())
+		we.Set("response.gin_errors", errorMessages(ginContext.Errors))
 	}
 	if m.postEnricher != nil {
 		m.postEnricher(we, ginContext)
 	}
-	we.Emit() // a no-op when the handler emitted the event itself
-
-	if recovered != nil {
-		panic(recovered)
-	}
 }
 
-// requestID returns incoming when it is printable ASCII of at most maximumRequestIDLength characters,
-// otherwise a new random ID.
+// errorMessages formats each error with fmt, which survives an Error method that panics on a typed nil.
+func errorMessages(ginErrors []*gin.Error) []string {
+	messages := make([]string, len(ginErrors))
+	for index, ginError := range ginErrors {
+		messages[index] = fmt.Sprint(ginError.Err)
+	}
+	return messages
+}
+
+// requestID returns incoming when it is a valid request ID, otherwise a new random one.
 func requestID(incoming string) string {
-	if incoming != "" && len(incoming) <= maximumRequestIDLength && isPrintableASCII(incoming) {
+	if isValidRequestID(incoming) {
 		return incoming
 	}
 	return rand.Text()
 }
 
+func isValidRequestID(incoming string) bool {
+	return incoming != "" && len(incoming) <= maximumRequestIDLength && isPrintableASCII(incoming)
+}
+
 func isPrintableASCII(text string) bool {
 	for index := range len(text) {
-		if text[index] < '!' || text[index] > '~' {
+		if text[index] < firstPrintableASCII || text[index] > lastPrintableASCII {
 			return false
 		}
 	}

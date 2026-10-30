@@ -32,7 +32,7 @@ Every layer adds what it did to the same event, and the event is emitted once at
 go get github.com/govengers/wide-event-logger
 ```
 
-The core package `wideevent` has no web framework dependency. The Gin middleware is in `wideevent/ginadapter`.
+The core package `wideevent` has no web framework dependency. The Gin middleware is in the subpackage `github.com/govengers/wide-event-logger/ginadapter`.
 
 ## Usage
 
@@ -54,7 +54,11 @@ func main() {
         log.Fatal(err)
     }
 
+    gin.SetMode(gin.ReleaseMode) // in debug mode gin.Recovery prints the raw request, cookies included
     engine := gin.New()
+    if err := engine.SetTrustedProxies(nil); err != nil { // or your proxies' addresses; request.client_ip trusts X-Forwarded-For only from them
+        log.Fatal(err)
+    }
     engine.Use(gin.Recovery(), middleware)
     engine.PUT("/api/v1/products/:id", func(ginContext *gin.Context) {
         we := ginadapter.FromContext(ginContext)
@@ -70,9 +74,10 @@ func main() {
 }
 ```
 
-The middleware records `request.method`, `path`, `query`, `host`, `proto`, `content_length`, `client_ip`, `user_agent`, `id`, `start_time`, then `response.status`, `body_size`, `gin_errors` (when there are any) and the event's `duration`. It emits when the handler returns, and also when the handler panics: the event gets `outcome=failure`, `error="panic: ..."` and status 500, and the panic is raised again for `gin.Recovery`.
+The middleware records `request.method`, `path`, `query`, `host`, `proto`, `content_length`, `client_ip`, `user_agent`, `id`, `start_time`, then `response.status`, `body_size`, `gin_errors` (when there are any) and the event's `duration`. It emits when the handler returns, and also when the handler or an enricher panics: the event gets `outcome=failure`, `error="panic: ..."` and status 500, and the panic is raised again for `gin.Recovery`. Handlers do not call `Emit` on the request event; the middleware does. Gin's automatic trailing-slash redirects run no middleware and produce no event.
 
 - **Query redaction:** every query value is recorded as `redacted` unless its parameter is in `QueryAllowlist`, so OAuth codes, tokens and personal data in URLs stay out of the logs.
+- **Bounded size:** client-controlled text is cut (path 2048 bytes, query and user agent 512, host 256), so a request cannot inflate its event.
 - **Request ID:** `request.id` is the client's `X-Request-ID` when it is printable ASCII of at most 128 characters, otherwise a generated one. It is echoed in the `X-Request-ID` response header.
 - `PreEnricher` and `PostEnricher` add fields before and after the handler, such as the authenticated user.
 
@@ -121,14 +126,15 @@ func (w *Worker) handle(ctx context.Context, job *model.Job) (err error) {
 - Setting a key again replaces its value. Fields keep the order in which their keys were first set.
 - Dots nest: `db.operation` becomes `{"db": {"operation": ...}}`. A key that is also a prefix of others keeps its value under `_value`.
 - After `Emit` the event is frozen: later writes are dropped. Work that outlives the request needs its own `Begin`.
+- Reserved: the key segment `_value`, and the root keys `level` and `message`, which the JSON emitter writes itself.
 - All methods are safe for concurrent use.
 
 ## Emitters
 
 | Emitter | Output |
 |---------|--------|
-| `NewJSONEmitter(&JSONEmitterOptions{Writer: w})` | one JSON line per event with `level` (`info`, `warn` for 4xx, `error` for failures and 5xx) and `message: "wide_event"`. A value JSON cannot represent (NaN, a channel) is written as text instead of losing the event. Default writer: stdout. |
-| `NewDevEmitter(&DevEmitterOptions{...})` | colorized blocks for a terminal, fields grouped by their first key segment. `Categories` and `MutedCategories` label or hide requests by path prefix. |
+| `NewJSONEmitter(&JSONEmitterOptions{Writer: w})` | one JSON line per event with `level` (`info`, `warn` for 4xx, `error` for failures and 5xx) and `message: "wide_event"`. Durations, times, errors, NaN and infinities among the field values are converted; a value JSON cannot encode at all (a channel, a cycle) becomes `"!unencodable <type>"` instead of losing the event. Default writer: stdout. |
+| `NewDevEmitter(&DevEmitterOptions{...})` | colorized blocks for a terminal, fields grouped by their first key segment, control characters escaped. `Categories` and `MutedCategories` label or hide requests by path prefix. |
 | `MultiEmitter(a, b)` | every event to each emitter |
 | `SampledEmitter(emitter, sampler)` | only the events the sampler keeps |
 | `EmitterFunc(func(we *Event))` | your own, for example to assert on events in tests |

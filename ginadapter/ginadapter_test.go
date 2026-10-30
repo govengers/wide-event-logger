@@ -2,6 +2,7 @@ package ginadapter
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -356,4 +357,124 @@ func TestNewMiddlewareCopiesOptions(t *testing.T) {
 	serve(t, engine, newRequest(t, http.MethodGet, "/api"))
 
 	require.Len(t, capture.emitted(), 1)
+}
+
+// newRecoveringEngine returns an engine with a silent recovery in front of the middleware.
+func newRecoveringEngine(t *testing.T, options Options) (*gin.Engine, *captureEmitter) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	capture := &captureEmitter{}
+	options.Emitter = capture
+	middleware, err := NewMiddleware(&options)
+	require.NoError(t, err)
+	engine := gin.New()
+	engine.Use(gin.CustomRecoveryWithWriter(io.Discard, func(ginContext *gin.Context, _ any) {
+		ginContext.AbortWithStatus(http.StatusInternalServerError)
+	}), middleware)
+	return engine, capture
+}
+
+func TestMiddlewareEmitsWhenAnEnricherPanics(t *testing.T) {
+	testCases := []struct {
+		name    string
+		options Options
+		handler gin.HandlerFunc
+		error   string
+	}{
+		{
+			name:    "pre-enricher",
+			options: Options{PreEnricher: func(*wideevent.Event, *gin.Context) { panic("pre") }},
+			handler: func(*gin.Context) {},
+			error:   "panic: pre",
+		},
+		{
+			name:    "post-enricher",
+			options: Options{PostEnricher: func(*wideevent.Event, *gin.Context) { panic("post") }},
+			handler: func(ginContext *gin.Context) { ginContext.Status(http.StatusOK) },
+			error:   "panic: post",
+		},
+		{
+			name:    "post-enricher after a handler panic keeps the first panic",
+			options: Options{PostEnricher: func(*wideevent.Event, *gin.Context) { panic("post") }},
+			handler: func(*gin.Context) { panic("handler") },
+			error:   "panic: handler",
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			engine, capture := newRecoveringEngine(t, testCase.options)
+			engine.GET("/", testCase.handler)
+
+			recorder := serve(t, engine, newRequest(t, http.MethodGet, "/"))
+
+			require.Equal(t, http.StatusInternalServerError, recorder.Code, "the panic reached the recovery")
+			values := onlyEvent(t, capture)
+			require.Equal(t, wideevent.OutcomeFailure, values[wideevent.KeyOutcome])
+			require.Equal(t, testCase.error, values[wideevent.KeyError])
+		})
+	}
+}
+
+// nilReceiverError panics in Error on a nil receiver.
+type nilReceiverError struct{ message string }
+
+func (failure *nilReceiverError) Error() string { return failure.message }
+
+func TestMiddlewareSurvivesATypedNilGinError(t *testing.T) {
+	engine, capture := newEngine(t, Options{})
+	engine.GET("/", func(ginContext *gin.Context) {
+		var typedNil *nilReceiverError
+		_ = ginContext.Error(typedNil)
+		ginContext.Status(http.StatusBadRequest)
+	})
+
+	serve(t, engine, newRequest(t, http.MethodGet, "/"))
+
+	require.Equal(t, []string{"<nil>"}, onlyEvent(t, capture)["response.gin_errors"])
+}
+
+func TestMiddlewareKeepsOneEventAcrossHandleContext(t *testing.T) {
+	var engine *gin.Engine
+	engine, capture := newEngine(t, Options{})
+	engine.GET("/old", func(ginContext *gin.Context) {
+		FromContext(ginContext).Str("redirect.from", "/old")
+		ginContext.Request.URL.Path = "/new"
+		engine.HandleContext(ginContext)
+	})
+	engine.GET("/new", func(ginContext *gin.Context) {
+		FromContext(ginContext).Str("redirect.to", "/new")
+		ginContext.Status(http.StatusOK)
+	})
+
+	serve(t, engine, newRequest(t, http.MethodGet, "/old"))
+
+	values := onlyEvent(t, capture)
+	require.Equal(t, "/old", values["redirect.from"])
+	require.Equal(t, "/new", values["redirect.to"])
+	require.Equal(t, http.StatusOK, values[wideevent.KeyResponseStatus])
+}
+
+func TestMiddlewareBoundsPathHostAndMethod(t *testing.T) {
+	engine, capture := newEngine(t, Options{})
+	engine.NoRoute(func(ginContext *gin.Context) { ginContext.Status(http.StatusNotFound) })
+	request := newRequest(t, http.MethodGet, "/"+strings.Repeat("p", 3000))
+	request.Host = strings.Repeat("h", 300)
+	request.Method = strings.Repeat("M", 40)
+
+	serve(t, engine, request)
+
+	values := onlyEvent(t, capture)
+	require.Len(t, values[wideevent.KeyRequestPath], maximumPathBytes)
+	require.Len(t, values["request.host"], maximumHostBytes)
+	require.Len(t, values[wideevent.KeyRequestMethod], maximumMethodBytes)
+}
+
+func TestMiddlewareParsesOnlyTheStartOfAHugeQuery(t *testing.T) {
+	engine, capture := newEngine(t, Options{QueryAllowlist: []string{"last"}})
+	engine.GET("/", func(*gin.Context) {})
+	target := "/?" + strings.Repeat("a=1&", 2000) + "last=kept"
+
+	serve(t, engine, newRequest(t, http.MethodGet, target))
+
+	require.Equal(t, "a=redacted", onlyEvent(t, capture)["request.query"], "last lies beyond the parsed prefix")
 }

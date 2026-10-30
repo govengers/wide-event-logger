@@ -14,7 +14,7 @@ func TestSamplers(t *testing.T) {
 	testCases := []struct {
 		name    string
 		sampler Sampler
-		event   *Event
+		we      *Event
 		keep    bool
 	}{
 		{"always", AlwaysSample(), success, true},
@@ -34,7 +34,7 @@ func TestSamplers(t *testing.T) {
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
-			require.Equal(t, testCase.keep, testCase.sampler.ShouldSample(testCase.event))
+			require.Equal(t, testCase.keep, testCase.sampler.ShouldSample(testCase.we))
 		})
 	}
 }

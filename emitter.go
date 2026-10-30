@@ -43,27 +43,6 @@ func SampledEmitter(emitter Emitter, sampler Sampler) Emitter {
 	})
 }
 
-// Log levels the emitters derive from an event.
-const (
-	levelInfo    = "info"
-	levelWarning = "warn"
-	levelError   = "error"
-)
-
-// minimumClientErrorStatus is the first response status logged as a warning.
-const minimumClientErrorStatus = 400
-
-// levelOf derives the log level: error for HasError, warn for a 4xx response, info otherwise.
-func levelOf(we *Event) string {
-	if we.HasError() {
-		return levelError
-	}
-	if we.StatusCode() >= minimumClientErrorStatus {
-		return levelWarning
-	}
-	return levelInfo
-}
-
 // JSONEmitterOptions configures a JSONEmitter.
 type JSONEmitterOptions struct {
 	// Writer receives one JSON line per event, in a single Write call. Default: os.Stdout.
@@ -71,9 +50,11 @@ type JSONEmitterOptions struct {
 }
 
 // JSONEmitter writes each event as one JSON line with dot-separated keys nested, plus "level" (info,
-// warn or error) and "message" ("wide_event"). Durations are written in milliseconds, times in RFC 3339
-// with nanoseconds, errors as their message. A value JSON cannot represent (NaN, a channel, a function)
-// is written as its fmt text instead of losing the event. It is safe for concurrent use.
+// warn or error) and "message" ("wide_event"), which replace fields of the same root key. Field values
+// that are durations are written in milliseconds, times in RFC 3339 with nanoseconds, errors as their
+// message, NaN and infinities as strings; values inside maps, slices and structs are encoded as they
+// are. A value JSON cannot encode at all (a channel, a cycle, a NaN inside a map) is replaced by
+// "!unencodable <type>" instead of losing the event. It is safe for concurrent use.
 type JSONEmitter struct {
 	mutex  sync.Mutex
 	writer io.Writer
@@ -96,14 +77,18 @@ func (emitter *JSONEmitter) Emit(we *Event) {
 	line := jsonLine(we)
 	emitter.mutex.Lock()
 	defer emitter.mutex.Unlock()
-	_, _ = emitter.writer.Write(line)
+	written, err := emitter.writer.Write(line)
+	if err != nil && written > 0 && written < len(line) {
+		_, _ = emitter.writer.Write([]byte{'\n'}) // end the fragment, so the next event starts on its own line
+	}
 }
 
 func jsonLine(we *Event) []byte {
 	fields := we.Fields()
 	line, err := encodeJSONLine(we, fields, jsonValue)
 	if err != nil {
-		// A value json cannot encode, a nested NaN or a channel: write those values as fmt text instead.
+		// A value json cannot encode: replace those values. This pass cannot fail, every value in it was
+		// marshaled on its own or is a string.
 		line, _ = encodeJSONLine(we, fields, encodableJSONValue)
 	}
 	return line
@@ -116,7 +101,7 @@ func encodeJSONLine(we *Event, fields []Field, convert func(any) any) ([]byte, e
 	}
 	document := nestFields(converted)
 	document["level"] = levelOf(we)
-	document["message"] = "wide_event"
+	document["message"] = defaultEventMessage
 
 	var buffer bytes.Buffer
 	encoder := json.NewEncoder(&buffer)
@@ -153,11 +138,36 @@ func finiteFloat(value float64) any {
 	return value
 }
 
-// encodableJSONValue is jsonValue, falling back to the fmt text of a value json cannot encode.
+// encodableJSONValue is jsonValue, replacing a value json cannot encode with its type. Its fmt text could
+// show unexported or json:"-" fields, and recurses forever on a cycle.
 func encodableJSONValue(value any) any {
 	converted := jsonValue(value)
 	if _, err := json.Marshal(converted); err != nil {
-		return fmt.Sprint(value)
+		return fmt.Sprintf("!unencodable %T", value)
 	}
 	return converted
+}
+
+// Log levels the emitters derive from an event.
+const (
+	levelInfo    = "info"
+	levelWarning = "warn"
+	levelError   = "error"
+)
+
+// defaultEventMessage is the JSON message of every event and the dev title of an event without a name.
+const defaultEventMessage = "wide_event"
+
+// minimumClientErrorStatus is the first response status logged as a warning.
+const minimumClientErrorStatus = 400
+
+// levelOf derives the log level: error for HasError, warn for a 4xx response, info otherwise.
+func levelOf(we *Event) string {
+	if we.HasError() {
+		return levelError
+	}
+	if we.StatusCode() >= minimumClientErrorStatus {
+		return levelWarning
+	}
+	return levelInfo
 }

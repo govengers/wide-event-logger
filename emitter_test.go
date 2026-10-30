@@ -131,3 +131,63 @@ func TestSampledEmitterSeesTheFinishedEvent(t *testing.T) {
 	require.Len(t, events, 1)
 	require.Equal(t, "kept", valuesOf(events[0])[KeyName])
 }
+
+// credentials has a field JSON must never show and a NaN that makes JSON fail.
+type credentials struct {
+	User     string  `json:"user"`
+	Password string  `json:"-"`
+	Score    float64 `json:"score"`
+	token    string
+}
+
+func TestJSONEmitterFallbackShowsNoHiddenFields(t *testing.T) {
+	document := emitJSON(t, func(we *Event) {
+		we.Set("login", credentials{User: "ada", Password: "hunter2", Score: math.NaN(), token: "abc"})
+	})
+
+	require.Equal(t, "!unencodable wideevent.credentials", document["login"])
+}
+
+func TestJSONEmitterSurvivesACycle(t *testing.T) {
+	cycle := map[string]any{}
+	cycle["self"] = cycle
+
+	document := emitJSON(t, func(we *Event) { we.Set("cycle", cycle).Str("kept", "yes") })
+
+	require.Equal(t, "!unencodable map[string]interface {}", document["cycle"])
+	require.Equal(t, "yes", document["kept"])
+}
+
+func TestJSONEmitterReservesLevelAndMessage(t *testing.T) {
+	document := emitJSON(t, func(we *Event) { we.Str("level", "debug") })
+	require.Equal(t, "info", document["level"])
+}
+
+// shortWriter accepts only the first limit bytes of its first write and fails it.
+type shortWriter struct {
+	bytes.Buffer
+	limit  int
+	failed bool
+}
+
+func (writer *shortWriter) Write(data []byte) (int, error) {
+	if !writer.failed && len(data) > writer.limit {
+		writer.failed = true
+		written, _ := writer.Buffer.Write(data[:writer.limit])
+		return written, errors.New("disk full")
+	}
+	return writer.Buffer.Write(data)
+}
+
+func TestJSONEmitterEndsAFragmentAfterAPartialWrite(t *testing.T) {
+	writer := &shortWriter{limit: 10}
+	emitter := NewJSONEmitter(&JSONEmitterOptions{Writer: writer})
+
+	Begin(emitter, "lost").Emit()
+	Begin(emitter, "kept").Emit()
+
+	lines := strings.Split(strings.TrimSuffix(writer.String(), "\n"), "\n")
+	require.Len(t, lines, 2)
+	require.False(t, json.Valid([]byte(lines[0])))
+	require.True(t, json.Valid([]byte(lines[1])), "the next event is a whole line")
+}

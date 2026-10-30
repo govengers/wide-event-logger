@@ -219,3 +219,23 @@ func TestColorAutoIsOffForAFileThatIsNotATerminal(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, color)
 }
+
+func TestDevEmitterEscapesControlCharacters(t *testing.T) {
+	output := emitDev(t, DevEmitterOptions{}, func(we *Event) {
+		we.Str(KeyRequestMethod, "GET").
+			Str(KeyRequestPath, "/x\n┌ forged line\033[2J").
+			Str("request.user_agent", "agent\r\nnext").
+			Failure(errors.New("bad\ninput"))
+	})
+
+	require.NotContains(t, output, "\033[2J")
+	require.Contains(t, output, `"GET /x\n┌ forged line\x1b[2J"`)
+	require.Contains(t, output, `user_agent="agent\r\nnext"`)
+	require.Contains(t, output, `error="bad\ninput"`)
+	require.Equal(t, 1, strings.Count(output, "┌ forged"), "the forged header is inside the quoted path")
+}
+
+func TestDevEmitterShowsANonStringError(t *testing.T) {
+	output := emitDev(t, DevEmitterOptions{}, func(we *Event) { we.Set(KeyError, errors.New("boom")) })
+	require.Contains(t, output, "error=boom")
+}
