@@ -101,14 +101,27 @@ func jsonLine(we *Event) []byte {
 		enclosingObjects := strings.Count(field.Key, ".") + 2
 		encoded[index] = Field{Key: field.Key, Value: encodeJSONValue(field.Value, enclosingObjects)}
 	}
-	document := nestFields(encoded)
+	line := encodeDocument(nestFields(encoded), we)
+	if !json.Valid(line) {
+		// Keys with thousands of segments nest too deep for a decoder: write the keys flat instead.
+		flat := make(map[string]any, len(encoded))
+		for _, field := range encoded {
+			flat[field.Key] = field.Value
+		}
+		line = encodeDocument(flat, we)
+	}
+	return append(line, '\n')
+}
+
+// encodeDocument adds level and message to document and encodes it.
+func encodeDocument(document map[string]any, we *Event) []byte {
 	document["level"] = levelOf(we)
 	document["message"] = defaultEventMessage
 	line, err := marshalJSON(document)
 	if err != nil {
 		return nil // unreachable: the document holds only strings and values marshalJSON encoded already
 	}
-	return append(line, '\n')
+	return line
 }
 
 // encodeJSONValue encodes one field value, or "!unencodable <type>". The placeholder never shows the
@@ -134,7 +147,7 @@ func marshalJSON(value any) (encoded []byte, err error) {
 	encoder := json.NewEncoder(&buffer)
 	encoder.SetEscapeHTML(false)
 	if encodeError := encoder.Encode(value); encodeError != nil {
-		return nil, fmt.Errorf("marshal %T: %w", value, encodeError)
+		return nil, encodeError // unformatted: a MarshalJSON error's own Error method may panic
 	}
 	return bytes.TrimSuffix(buffer.Bytes(), []byte{'\n'}), nil
 }

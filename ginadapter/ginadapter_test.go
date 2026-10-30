@@ -537,8 +537,34 @@ func TestMiddlewareRecordsACompositePanicValueByType(t *testing.T) {
 	require.Equal(t, "panic: map[string]interface {}", onlyEvent(t, capture)[wideevent.KeyError])
 }
 
+// panickingCode panics in String with a map that contains itself.
+type panickingCode int
+
+func (panickingCode) String() string {
+	cycle := map[string]any{}
+	cycle["self"] = cycle
+	panic(cycle)
+}
+
 func TestPanicText(t *testing.T) {
-	require.Equal(t, "boom", panicText(errors.New("boom")))
-	require.Equal(t, "42", panicText(42))
-	require.Equal(t, "[]string", panicText([]string{"secret"}))
+	testCases := []struct {
+		name      string
+		recovered any
+		text      string
+	}{
+		{"error", errors.New("boom"), "boom"},
+		{"string", "boom", "boom"},
+		{"int", 42, "42"},
+		{"uint", uint8(7), "7"},
+		{"float", 1.5, "1.5"},
+		{"bool", true, "true"},
+		{"named int with a panicking String", panickingCode(3), "3"},
+		{"slice", []string{"secret"}, "[]string"},
+		{"nil", nil, "<nil>"},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			require.Equal(t, testCase.text, panicText(testCase.recovered))
+		})
+	}
 }

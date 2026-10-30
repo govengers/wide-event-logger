@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"reflect"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -216,17 +217,27 @@ func recordPanic(we *wideevent.Event, ginContext *gin.Context, recovered any) {
 	}
 }
 
-// panicText formats a panic value: a string, an error or a scalar as fmt prints it, a composite value as its
-// type only, since fmt recurses forever on a cyclic map and would show unexported fields.
+// panicText formats a panic value: an error through its message, a string, number or bool by its value
+// without calling any of its methods, anything else as its type only. fmt would call String or Format
+// methods, show unexported fields, and recurse forever on a cyclic map.
 func panicText(recovered any) string {
 	if recoveredError, isError := recovered.(error); isError {
 		return safetext.Of(recoveredError, recoveredError.Error)
 	}
-	switch reflect.ValueOf(recovered).Kind() {
-	case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct, reflect.Pointer, reflect.Interface:
-		return fmt.Sprintf("%T", recovered)
+	value := reflect.ValueOf(recovered)
+	switch value.Kind() {
+	case reflect.String:
+		return value.String()
+	case reflect.Bool:
+		return strconv.FormatBool(value.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return strconv.FormatInt(value.Int(), 10)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return strconv.FormatUint(value.Uint(), 10)
+	case reflect.Float32, reflect.Float64:
+		return strconv.FormatFloat(value.Float(), 'g', -1, 64)
 	default:
-		return fmt.Sprint(recovered)
+		return fmt.Sprintf("%T", recovered)
 	}
 }
 

@@ -255,3 +255,31 @@ func TestJSONEmitterCountsAConflictLevelIntoTheNestingLimit(t *testing.T) {
 
 	require.Equal(t, map[string]any{"_value": "!unencodable []interface {}", "b": float64(1)}, document["a"])
 }
+
+func TestJSONEmitterWritesTooDeepKeysFlat(t *testing.T) {
+	key := strings.Repeat("a.", 10000) + "b"
+
+	document := emitJSON(t, func(we *Event) { we.Int(key, 1).String("kept", "yes") })
+
+	require.Contains(t, document, key)
+	require.Equal(t, "yes", document["kept"])
+}
+
+// panickingMessageError panics in Error with a map that contains itself.
+type panickingMessageError struct{}
+
+func (panickingMessageError) Error() string {
+	cycle := map[string]any{}
+	cycle["self"] = cycle
+	panic(cycle)
+}
+
+// failingMarshaler returns an error whose Error method panics.
+type failingMarshaler struct{}
+
+func (failingMarshaler) MarshalJSON() ([]byte, error) { return nil, panickingMessageError{} }
+
+func TestJSONEmitterNeverFormatsAMarshalError(t *testing.T) {
+	document := emitJSON(t, func(we *Event) { we.Set("broken", failingMarshaler{}) })
+	require.Equal(t, "!unencodable wideevent.failingMarshaler", document["broken"])
+}
