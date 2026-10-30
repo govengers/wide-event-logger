@@ -6,7 +6,7 @@
 // production, NewDevEmitter for a terminal. SampledEmitter keeps only the events a Sampler selects.
 //
 // Every method of *Event is safe for concurrent use and a no-op on a nil *Event, so code can write
-// wideevent.FromContext(ctx).Str("db.operation", "update") without checking whether a unit of work is
+// wideevent.FromContext(ctx).String("db.operation", "update") without checking whether a unit of work is
 // running. The Gin middleware lives in the ginadapter subpackage, so this package has no web framework
 // dependency.
 package wideevent

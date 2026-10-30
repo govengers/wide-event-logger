@@ -25,12 +25,12 @@ func emitDev(t *testing.T, options DevEmitterOptions, record func(we *Event)) st
 }
 
 func recordHTTPRequest(we *Event) {
-	we.Str(KeyRequestMethod, "GET").
-		Str(KeyRequestPath, "/api/v1/users").
-		Str("request.host", "localhost:8080").
+	we.String(KeyRequestMethod, "GET").
+		String(KeyRequestPath, "/api/v1/users").
+		String("request.host", "localhost:8080").
 		Int(KeyResponseStatus, 200).
 		Int("response.body_size", 1842).
-		Str("user.name", "ada").
+		String("user.name", "ada").
 		Success()
 }
 
@@ -61,18 +61,18 @@ func TestDevEmitterLeavesSummaryFieldsOutOfTheBody(t *testing.T) {
 }
 
 func TestDevEmitterTitlesAnEventWithoutRequestByName(t *testing.T) {
-	output := emitDev(t, DevEmitterOptions{}, func(we *Event) { we.Str("job.id", "7") })
+	output := emitDev(t, DevEmitterOptions{}, func(we *Event) { we.String("job.id", "7") })
 	require.Contains(t, strings.Split(output, "\n")[0], "  job")
 
-	output = emitDev(t, DevEmitterOptions{}, func(we *Event) { we.Str(KeyName, "") })
+	output = emitDev(t, DevEmitterOptions{}, func(we *Event) { we.String(KeyName, "") })
 	require.Contains(t, strings.Split(output, "\n")[0], "  wide_event")
 	require.NotContains(t, output, "│", "an event without body fields has no body")
 }
 
 func TestDevEmitterOrdersGroups(t *testing.T) {
 	output := emitDev(t, DevEmitterOptions{}, func(we *Event) {
-		we.Str("standalone", "x").Str("db.operation", "update").Str("user.id", "1").
-			Str("response.size", "2").Str("request.host", "h").Str("cache.hit", "yes")
+		we.String("standalone", "x").String("db.operation", "update").String("user.id", "1").
+			String("response.size", "2").String("request.host", "h").String("cache.hit", "yes")
 	})
 
 	order := []string{"request", "response", "user", "db", "cache", "standalone="}
@@ -86,7 +86,7 @@ func TestDevEmitterOrdersGroups(t *testing.T) {
 
 func TestDevEmitterPrintsTheLatestValueOnce(t *testing.T) {
 	output := emitDev(t, DevEmitterOptions{}, func(we *Event) {
-		we.Str("request.query", "code=secret").Str("request.query", "code=redacted")
+		we.String("request.query", "code=secret").String("request.query", "code=redacted")
 	})
 
 	require.NotContains(t, output, "secret")
@@ -95,11 +95,11 @@ func TestDevEmitterPrintsTheLatestValueOnce(t *testing.T) {
 
 func TestDevEmitterFormatsValues(t *testing.T) {
 	output := emitDev(t, DevEmitterOptions{}, func(we *Event) {
-		we.Dur("timing.fast", 250*time.Microsecond).
-			Dur("timing.medium", 12500*time.Microsecond).
-			Dur("timing.slow", 2500*time.Millisecond).
+		we.Duration("timing.fast", 250*time.Microsecond).
+			Duration("timing.medium", 12500*time.Microsecond).
+			Duration("timing.slow", 2500*time.Millisecond).
 			Time("timing.at", time.Date(2026, 1, 2, 15, 4, 5, 123000000, time.UTC)).
-			Str("timing.empty", "")
+			String("timing.empty", "")
 	})
 
 	require.Contains(t, output, "fast=250µs")
@@ -112,7 +112,7 @@ func TestDevEmitterFormatsValues(t *testing.T) {
 func TestDevEmitterWrapsLongGroups(t *testing.T) {
 	output := emitDev(t, DevEmitterOptions{}, func(we *Event) {
 		for _, key := range []string{"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"} {
-			we.Str("group."+key, strings.Repeat("v", 10))
+			we.String("group."+key, strings.Repeat("v", 10))
 		}
 	})
 
@@ -159,7 +159,7 @@ func TestDevEmitterCategories(t *testing.T) {
 		MutedCategories: []string{"health"},
 	}
 	request := func(path string) func(we *Event) {
-		return func(we *Event) { we.Str(KeyRequestMethod, "GET").Str(KeyRequestPath, path) }
+		return func(we *Event) { we.String(KeyRequestMethod, "GET").String(KeyRequestPath, path) }
 	}
 
 	require.Empty(t, emitDev(t, options, request("/ready/db")), "a muted category writes nothing")
@@ -222,9 +222,9 @@ func TestColorAutoIsOffForAFileThatIsNotATerminal(t *testing.T) {
 
 func TestDevEmitterEscapesControlCharacters(t *testing.T) {
 	output := emitDev(t, DevEmitterOptions{}, func(we *Event) {
-		we.Str(KeyRequestMethod, "GET").
-			Str(KeyRequestPath, "/x\n┌ forged line\033[2J").
-			Str("request.user_agent", "agent\r\nnext").
+		we.String(KeyRequestMethod, "GET").
+			String(KeyRequestPath, "/x\n┌ forged line\033[2J").
+			String("request.user_agent", "agent\r\nnext").
 			Failure(errors.New("bad\ninput"))
 	})
 

@@ -19,7 +19,7 @@ func ExampleNewMiddleware() {
 		SkipPaths:      []string{"/api/health"},
 		QueryAllowlist: []string{"page", "sort"},
 		PreEnricher: func(we *wideevent.Event, ginContext *gin.Context) {
-			we.Str("tenant.id", ginContext.GetHeader("X-Tenant"))
+			we.String("tenant.id", ginContext.GetHeader("X-Tenant"))
 		},
 	})
 	if err != nil {
@@ -31,7 +31,7 @@ func ExampleNewMiddleware() {
 	engine.Use(gin.Recovery(), middleware)
 	engine.GET("/api/users/:id", func(ginContext *gin.Context) {
 		we := ginadapter.FromContext(ginContext)
-		we.Str("user.lookup_id", ginContext.Param("id")).Success()
+		we.String("user.lookup_id", ginContext.Param("id")).Success()
 		ginContext.Status(http.StatusNoContent)
 	})
 }

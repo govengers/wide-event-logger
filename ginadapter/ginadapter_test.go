@@ -75,7 +75,7 @@ func onlyEvent(t *testing.T, capture *captureEmitter) map[string]any {
 func TestMiddlewareRecordsRequestAndResponse(t *testing.T) {
 	engine, capture := newEngine(t, Options{})
 	engine.POST("/api/users", func(ginContext *gin.Context) {
-		FromContext(ginContext).Str("user.action", "create").Success()
+		FromContext(ginContext).String("user.action", "create").Success()
 		ginContext.String(http.StatusCreated, "created")
 	})
 	request := newRequest(t, http.MethodPost, "/api/users")
@@ -207,7 +207,7 @@ func TestMiddlewareSkipsPaths(t *testing.T) {
 	engine, capture := newEngine(t, Options{SkipPaths: []string{"/health"}})
 	engine.GET("/health", func(ginContext *gin.Context) {
 		require.Nil(t, FromContext(ginContext))
-		FromContext(ginContext).Str("written", "to a nil event") // must not panic
+		FromContext(ginContext).String("written", "to a nil event") // must not panic
 		ginContext.Status(http.StatusOK)
 	})
 	engine.GET("/api", func(*gin.Context) {})
@@ -223,7 +223,7 @@ func TestMiddlewareRunsEnrichers(t *testing.T) {
 	engine, capture := newEngine(t, Options{
 		PreEnricher: func(we *wideevent.Event, ginContext *gin.Context) {
 			order = append(order, "pre")
-			we.Str("tenant.id", ginContext.GetHeader("X-Tenant"))
+			we.String("tenant.id", ginContext.GetHeader("X-Tenant"))
 		},
 		PostEnricher: func(we *wideevent.Event, ginContext *gin.Context) {
 			order = append(order, "post")
@@ -322,7 +322,7 @@ func TestMiddlewareSamplesTheFinishedEvent(t *testing.T) {
 func TestMiddlewareGivesEachRequestItsOwnEvent(t *testing.T) {
 	engine, capture := newEngine(t, Options{})
 	engine.GET("/:id", func(ginContext *gin.Context) {
-		FromContext(ginContext).Str("item.id", ginContext.Param("id"))
+		FromContext(ginContext).String("item.id", ginContext.Param("id"))
 	})
 
 	serve(t, engine, newRequest(t, http.MethodGet, "/1"))
@@ -437,12 +437,12 @@ func TestMiddlewareKeepsOneEventAcrossHandleContext(t *testing.T) {
 	var engine *gin.Engine
 	engine, capture := newEngine(t, Options{})
 	engine.GET("/old", func(ginContext *gin.Context) {
-		FromContext(ginContext).Str("redirect.from", "/old")
+		FromContext(ginContext).String("redirect.from", "/old")
 		ginContext.Request.URL.Path = "/new"
 		engine.HandleContext(ginContext)
 	})
 	engine.GET("/new", func(ginContext *gin.Context) {
-		FromContext(ginContext).Str("redirect.to", "/new")
+		FromContext(ginContext).String("redirect.to", "/new")
 		ginContext.Status(http.StatusOK)
 	})
 

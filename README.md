@@ -62,7 +62,7 @@ func main() {
     engine.Use(gin.Recovery(), middleware)
     engine.PUT("/api/v1/products/:id", func(ginContext *gin.Context) {
         we := ginadapter.FromContext(ginContext)
-        we.Str("name", "update_product")
+        we.String("name", "update_product")
         if err := products.Update(ginContext.Request.Context(), ginContext.Param("id")); err != nil {
             we.Failure(err)
             ginContext.Status(http.StatusConflict)
@@ -87,7 +87,7 @@ Services and repositories find the event in the context. Outside a unit of work 
 
 ```go
 func (r *ProductRepository) Update(ctx context.Context, product *model.Product) error {
-    wideevent.FromContext(ctx).Str("db.operation", "update").Str("db.entity", "product")
+    wideevent.FromContext(ctx).String("db.operation", "update").String("db.entity", "product")
     ...
 }
 ```
@@ -113,8 +113,8 @@ func (w *Worker) handle(ctx context.Context, job *model.Job) (err error) {
 
 | Method | Records |
 |--------|---------|
-| `Str`, `Int`, `Int64`, `Float64`, `Bool`, `Set` | a value |
-| `Dur` | a duration (JSON: milliseconds) |
+| `String`, `Int`, `Int64`, `Float64`, `Bool`, `Set` | a value |
+| `Duration` | a duration (JSON: milliseconds) |
 | `Time` | a time (JSON: RFC 3339 with nanoseconds) |
 | `Err(key, err)` | the error message; nil records nothing |
 | `UUID(key, id)` | the text of any `fmt.Stringer`; nil records nothing |

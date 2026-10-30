@@ -60,7 +60,7 @@ func Begin(emitter Emitter, name string) *Event {
 		emitter:   emitter,
 		startTime: time.Now(),
 	}
-	return we.Str(KeyName, name)
+	return we.String(KeyName, name)
 }
 
 // Emit sets the duration since Begin and hands the event to its emitter. Only the first call emits.
@@ -103,8 +103,8 @@ func (we *Event) put(key string, value any) {
 	we.values[key] = value
 }
 
-// Str records a string.
-func (we *Event) Str(key, value string) *Event {
+// String records a string.
+func (we *Event) String(key, value string) *Event {
 	return we.Set(key, value)
 }
 
@@ -128,8 +128,8 @@ func (we *Event) Bool(key string, value bool) *Event {
 	return we.Set(key, value)
 }
 
-// Dur records a duration. The JSON emitter writes it in milliseconds.
-func (we *Event) Dur(key string, value time.Duration) *Event {
+// Duration records a duration. The JSON emitter writes it in milliseconds.
+func (we *Event) Duration(key string, value time.Duration) *Event {
 	return we.Set(key, value)
 }
 

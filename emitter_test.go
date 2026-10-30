@@ -29,7 +29,7 @@ func emitJSON(t *testing.T, record func(we *Event)) map[string]any {
 
 func TestJSONEmitterWritesNestedFieldsLevelAndMessage(t *testing.T) {
 	document := emitJSON(t, func(we *Event) {
-		we.Str("db.operation", "update").Str("html", "<b>").Success()
+		we.String("db.operation", "update").String("html", "<b>").Success()
 	})
 
 	require.Equal(t, "job", document["name"])
@@ -44,7 +44,7 @@ func TestJSONEmitterWritesNestedFieldsLevelAndMessage(t *testing.T) {
 func TestJSONEmitterConvertsValues(t *testing.T) {
 	emittedAt := time.Date(2026, 10, 30, 12, 0, 0, 5, time.UTC)
 	document := emitJSON(t, func(we *Event) {
-		we.Dur("elapsed", 1500*time.Microsecond).
+		we.Duration("elapsed", 1500*time.Microsecond).
 			Time("at", emittedAt).
 			Set("error_value", errors.New("boom")).
 			Float64("not_a_number", math.NaN()).
@@ -66,7 +66,7 @@ func TestJSONEmitterConvertsValues(t *testing.T) {
 
 func TestJSONEmitterSurvivesANestedUnencodableValue(t *testing.T) {
 	document := emitJSON(t, func(we *Event) {
-		we.Set("nested", map[string]any{"value": math.NaN()}).Str("kept", "yes")
+		we.Set("nested", map[string]any{"value": math.NaN()}).String("kept", "yes")
 	})
 
 	require.Equal(t, "yes", document["kept"])
@@ -96,7 +96,7 @@ func TestJSONEmitterWritesWholeLinesConcurrently(t *testing.T) {
 	emitter := NewJSONEmitter(&JSONEmitterOptions{Writer: &buffer})
 	var waitGroup sync.WaitGroup
 	for range 20 {
-		waitGroup.Go(func() { Begin(emitter, "job").Str("payload", strings.Repeat("x", 1000)).Emit() })
+		waitGroup.Go(func() { Begin(emitter, "job").String("payload", strings.Repeat("x", 1000)).Emit() })
 	}
 	waitGroup.Wait()
 
@@ -152,14 +152,14 @@ func TestJSONEmitterSurvivesACycle(t *testing.T) {
 	cycle := map[string]any{}
 	cycle["self"] = cycle
 
-	document := emitJSON(t, func(we *Event) { we.Set("cycle", cycle).Str("kept", "yes") })
+	document := emitJSON(t, func(we *Event) { we.Set("cycle", cycle).String("kept", "yes") })
 
 	require.Equal(t, "!unencodable map[string]interface {}", document["cycle"])
 	require.Equal(t, "yes", document["kept"])
 }
 
 func TestJSONEmitterReservesLevelAndMessage(t *testing.T) {
-	document := emitJSON(t, func(we *Event) { we.Str("level", "debug") })
+	document := emitJSON(t, func(we *Event) { we.String("level", "debug") })
 	require.Equal(t, "info", document["level"])
 }
 

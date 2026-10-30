@@ -149,15 +149,15 @@ func (m *middleware) recordRequest(we *wideevent.Event, ginContext *gin.Context)
 
 	// ParseQuery keeps the valid pairs of a malformed query, like URL.Query.
 	query, _ := url.ParseQuery(truncate(request.URL.RawQuery, maximumParsedQueryBytes))
-	we.Str(wideevent.KeyRequestMethod, truncate(request.Method, maximumMethodBytes)).
-		Str(wideevent.KeyRequestPath, truncate(request.URL.Path, maximumPathBytes)).
-		Str("request.query", redactQuery(query, m.queryAllowlist)).
-		Str("request.host", truncate(request.Host, maximumHostBytes)).
-		Str("request.proto", request.Proto).
+	we.String(wideevent.KeyRequestMethod, truncate(request.Method, maximumMethodBytes)).
+		String(wideevent.KeyRequestPath, truncate(request.URL.Path, maximumPathBytes)).
+		String("request.query", redactQuery(query, m.queryAllowlist)).
+		String("request.host", truncate(request.Host, maximumHostBytes)).
+		String("request.proto", request.Proto).
 		Int64("request.content_length", request.ContentLength).
-		Str("request.client_ip", ginContext.ClientIP()).
-		Str("request.user_agent", truncate(request.UserAgent(), maximumUserAgentBytes)).
-		Str("request.id", id).
+		String("request.client_ip", ginContext.ClientIP()).
+		String("request.user_agent", truncate(request.UserAgent(), maximumUserAgentBytes)).
+		String("request.id", id).
 		Time("request.start_time", time.Now())
 }
 

@@ -90,7 +90,7 @@ func get(t *testing.T, url string, header http.Header) (int, http.Header) {
 
 // findProduct stands in for a layer below the handler: it records on the event from the context.
 func findProduct(ctx context.Context, id string) error {
-	wideevent.FromContext(ctx).Str("db.operation", "select").Str("db.entity", "product").Int("db.rows", 0)
+	wideevent.FromContext(ctx).String("db.operation", "select").String("db.entity", "product").Int("db.rows", 0)
 	return errors.New("product " + id + " not found")
 }
 
@@ -101,7 +101,7 @@ func TestRequestEventReachesTheLog(t *testing.T) {
 		QueryAllowlist: []string{"expand"},
 	}, func(engine *gin.Engine) {
 		engine.GET("/api/products/:id", func(ginContext *gin.Context) {
-			we := ginadapter.FromContext(ginContext).Str("name", "get_product")
+			we := ginadapter.FromContext(ginContext).String("name", "get_product")
 			if err := findProduct(ginContext.Request.Context(), ginContext.Param("id")); err != nil {
 				we.Failure(err)
 				ginContext.Status(http.StatusNotFound)

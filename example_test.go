@@ -34,7 +34,7 @@ func ExampleBegin() {
 // FromContext returns nil outside a unit of work, and the methods of a nil event do nothing.
 func ExampleFromContext() {
 	we := wideevent.FromContext(context.Background())
-	we.Str("db.operation", "update")
+	we.String("db.operation", "update")
 	fmt.Println(we == nil)
 	// Output: true
 }

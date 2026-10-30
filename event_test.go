@@ -49,12 +49,12 @@ func (failure *nilPointerError) Error() string { return failure.message }
 func TestTypedSettersRecordValues(t *testing.T) {
 	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
 	we := Begin(nil, "job").
-		Str("string", "value").
+		String("string", "value").
 		Int("int", 42).
 		Int64("int64", 7).
 		Float64("float", 1.5).
 		Bool("bool", true).
-		Dur("duration_field", time.Second).
+		Duration("duration_field", time.Second).
 		Time("time", now).
 		Err("error_field", errors.New("boom")).
 		UUID("uuid", textID("0192")).
@@ -93,7 +93,7 @@ func TestNilArgumentsRecordNothing(t *testing.T) {
 }
 
 func TestSettingAKeyAgainReplacesItsValueAndKeepsItsPosition(t *testing.T) {
-	we := Begin(nil, "job").Str("first", "a").Str("second", "b").Str("first", "c")
+	we := Begin(nil, "job").String("first", "a").String("second", "b").String("first", "c")
 
 	require.Equal(t, []Field{{KeyName, "job"}, {"first", "c"}, {"second", "b"}}, we.Fields())
 }
@@ -112,7 +112,7 @@ func TestSuccessAndFailureSetTheOutcome(t *testing.T) {
 func TestNilEventMethodsDoNothing(t *testing.T) {
 	var we *Event
 	require.NotPanics(t, func() {
-		we.Str("a", "b").Int("c", 1).Success().Failure(errors.New("x")).UserID(textID("1")).Emit()
+		we.String("a", "b").Int("c", 1).Success().Failure(errors.New("x")).UserID(textID("1")).Emit()
 	})
 	require.Nil(t, we.Fields())
 	require.Empty(t, we.FieldsMap())
@@ -137,7 +137,7 @@ func TestWritesAfterEmitAreDropped(t *testing.T) {
 	we := Begin(&captureEmitter{}, "job")
 	we.Emit()
 
-	we.Str("late", "write").Failure(errors.New("too late"))
+	we.String("late", "write").Failure(errors.New("too late"))
 
 	values := valuesOf(we)
 	require.NotContains(t, values, "late")
@@ -161,7 +161,7 @@ func TestHasErrorAndStatusCodeReadTheLatestValues(t *testing.T) {
 		{"server error", func(we *Event) { we.Int(KeyResponseStatus, 503) }, true, 503},
 		{"client error", func(we *Event) { we.Int(KeyResponseStatus, 404) }, false, 404},
 		{"status replaced", func(we *Event) { we.Int(KeyResponseStatus, 500).Int(KeyResponseStatus, 200) }, false, 200},
-		{"status not an int", func(we *Event) { we.Str(KeyResponseStatus, "500") }, false, 0},
+		{"status not an int", func(we *Event) { we.String(KeyResponseStatus, "500") }, false, 0},
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -189,7 +189,7 @@ func TestConcurrentWritesKeepEveryKey(t *testing.T) {
 }
 
 func TestFieldsMapNests(t *testing.T) {
-	we := Begin(nil, "job").Str("db.operation", "update").Int("db.rows", 3)
+	we := Begin(nil, "job").String("db.operation", "update").Int("db.rows", 3)
 
 	require.Equal(t, map[string]any{
 		KeyName: "job",
