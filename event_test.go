@@ -6,240 +6,219 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
-type testStringer struct{ val string }
+// captureEmitter collects emitted events for assertions. It is safe for concurrent use.
+type captureEmitter struct {
+	mutex  sync.Mutex
+	events []*Event
+}
 
-func (s testStringer) String() string { return s.val }
+func (capture *captureEmitter) Emit(we *Event) {
+	capture.mutex.Lock()
+	defer capture.mutex.Unlock()
+	capture.events = append(capture.events, we)
+}
 
-func TestConcurrentFieldAccumulation(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
-	evt := Begin(emitter, "concurrent_test")
+func (capture *captureEmitter) emitted() []*Event {
+	capture.mutex.Lock()
+	defer capture.mutex.Unlock()
+	return append([]*Event(nil), capture.events...)
+}
 
-	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func(n int) {
-			defer wg.Done()
-			evt.Set(fmt.Sprintf("field_%d", n), n)
-		}(i)
+// valuesOf returns the fields of we by key.
+func valuesOf(we *Event) map[string]any {
+	values := map[string]any{}
+	for _, field := range we.Fields() {
+		values[field.Key] = field.Value
 	}
-	wg.Wait()
+	return values
+}
 
-	fields := evt.Fields()
-	// 1 for name + 100 from goroutines
-	if len(fields) != 101 {
-		t.Errorf("expected 101 fields, got %d", len(fields))
-	}
+type textID string
 
-	// Verify all 100 goroutine fields are present
-	seen := make(map[string]bool)
-	for _, f := range fields {
-		seen[f.Key] = true
+func (id textID) String() string { return string(id) }
+
+// nilPointerError has an Error method that panics on a nil receiver.
+type nilPointerError struct{ message string }
+
+func (failure *nilPointerError) Error() string { return failure.message }
+
+func TestTypedSettersRecordValues(t *testing.T) {
+	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	we := Begin(nil, "job").
+		String("string", "value").
+		Int("int", 42).
+		Int64("int64", 7).
+		Float64("float", 1.5).
+		Bool("bool", true).
+		Duration("duration_field", time.Second).
+		Time("time", now).
+		Err("error_field", errors.New("boom")).
+		UUID("uuid", textID("0192")).
+		UserID(textID("user-1")).
+		UserName("ada").
+		UserRole("admin").
+		Set("any", []int{1})
+
+	require.Equal(t, map[string]any{
+		KeyName:          "job",
+		"string":         "value",
+		"int":            42,
+		"int64":          int64(7),
+		"float":          1.5,
+		"bool":           true,
+		"duration_field": time.Second,
+		"time":           now,
+		"error_field":    "boom",
+		"uuid":           "0192",
+		"user.id":        "user-1",
+		"user.name":      "ada",
+		"user.role":      "admin",
+		"any":            []int{1},
+	}, valuesOf(we))
+}
+
+func TestNilArgumentsRecordNothing(t *testing.T) {
+	var typedNil *nilPointerError
+	we := Begin(nil, "job").Err("nil_error", nil).UUID("nil_id", nil).UserID(nil).Err("typed_nil", typedNil)
+
+	values := valuesOf(we)
+	require.NotContains(t, values, "nil_error")
+	require.NotContains(t, values, "nil_id")
+	require.NotContains(t, values, "user.id")
+	require.Contains(t, values, "typed_nil", "a typed nil error is not nil and must not panic")
+}
+
+func TestSettingAKeyAgainReplacesItsValueAndKeepsItsPosition(t *testing.T) {
+	we := Begin(nil, "job").String("first", "a").String("second", "b").String("first", "c")
+
+	require.Equal(t, []Field{{KeyName, "job"}, {"first", "c"}, {"second", "b"}}, we.Fields())
+}
+
+func TestSuccessAndFailureSetTheOutcome(t *testing.T) {
+	we := Begin(nil, "job").Failure(errors.New("conflict"))
+	require.Equal(t, OutcomeFailure, valuesOf(we)[KeyOutcome])
+	require.Equal(t, "conflict", valuesOf(we)[KeyError])
+
+	we.Success()
+	require.Equal(t, OutcomeSuccess, valuesOf(we)[KeyOutcome])
+
+	require.NotContains(t, valuesOf(Begin(nil, "job").Failure(nil)), KeyError)
+}
+
+func TestNilEventMethodsDoNothing(t *testing.T) {
+	var we *Event
+	require.NotPanics(t, func() {
+		we.String("a", "b").Int("c", 1).Success().Failure(errors.New("x")).UserID(textID("1")).Emit()
+	})
+	require.Nil(t, we.Fields())
+	require.Empty(t, we.FieldsMap())
+	require.False(t, we.HasError())
+	require.Zero(t, we.StatusCode())
+}
+
+func TestEmitSetsDurationAndEmitsOnce(t *testing.T) {
+	capture := &captureEmitter{}
+	we := Begin(capture, "job")
+
+	we.Emit()
+	we.Emit()
+
+	require.Len(t, capture.emitted(), 1)
+	duration, ok := valuesOf(we)[KeyDuration].(time.Duration)
+	require.True(t, ok)
+	require.GreaterOrEqual(t, duration, time.Duration(0))
+}
+
+func TestWritesAfterEmitAreDropped(t *testing.T) {
+	we := Begin(&captureEmitter{}, "job")
+	we.Emit()
+
+	we.String("late", "write").Failure(errors.New("too late"))
+
+	values := valuesOf(we)
+	require.NotContains(t, values, "late")
+	require.NotContains(t, values, KeyOutcome)
+}
+
+func TestBeginWithNilEmitterDiscards(t *testing.T) {
+	require.NotPanics(t, Begin(nil, "job").Emit)
+}
+
+func TestHasErrorAndStatusCodeReadTheLatestValues(t *testing.T) {
+	testCases := []struct {
+		name     string
+		record   func(we *Event)
+		hasError bool
+		status   int
+	}{
+		{"nothing", func(*Event) {}, false, 0},
+		{"failure", func(we *Event) { we.Failure(nil) }, true, 0},
+		{"success after failure", func(we *Event) { we.Failure(nil).Success() }, false, 0},
+		{"server error", func(we *Event) { we.Int(KeyResponseStatus, 503) }, true, 503},
+		{"client error", func(we *Event) { we.Int(KeyResponseStatus, 404) }, false, 404},
+		{"status replaced", func(we *Event) { we.Int(KeyResponseStatus, 500).Int(KeyResponseStatus, 200) }, false, 200},
+		{"status not an int", func(we *Event) { we.String(KeyResponseStatus, "500") }, false, 0},
 	}
-	for i := 0; i < 100; i++ {
-		key := fmt.Sprintf("field_%d", i)
-		if !seen[key] {
-			t.Errorf("missing field %s", key)
-		}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			we := Begin(nil, "job")
+			testCase.record(we)
+			require.Equal(t, testCase.hasError, we.HasError())
+			require.Equal(t, testCase.status, we.StatusCode())
+		})
 	}
 }
 
-func TestMethodChainingReturnsSameEvent(t *testing.T) {
-	evt := Begin(nil, "chain_test")
-
-	got := evt.Str("a", "b").Int("c", 1).Bool("d", true).Float64("e", 1.5)
-	if got != evt {
-		t.Error("chaining should return the same *Event")
+func TestConcurrentWritesKeepEveryKey(t *testing.T) {
+	we := Begin(nil, "job")
+	var waitGroup sync.WaitGroup
+	for worker := range 50 {
+		waitGroup.Go(func() {
+			we.Int(fmt.Sprintf("worker.%d", worker), worker)
+			_ = we.HasError()
+			_ = we.Fields()
+		})
 	}
+	waitGroup.Wait()
+
+	require.Len(t, we.Fields(), 51)
 }
 
-func TestTypedSetters(t *testing.T) {
-	evt := Begin(nil, "typed_test")
+func TestFieldsMapNests(t *testing.T) {
+	we := Begin(nil, "job").String("db.operation", "update").Int("db.rows", 3)
 
-	now := time.Now()
-	dur := 5 * time.Second
-
-	evt.Str("s", "hello")
-	evt.Int("i", 42)
-	evt.Int64("i64", int64(99))
-	evt.Float64("f64", 3.14)
-	evt.Bool("b", true)
-	evt.Dur("dur", dur)
-	evt.Time("t", now)
-	evt.Err("err", errors.New("boom"))
-	evt.Interface("iface", map[string]int{"x": 1})
-	evt.UUID("uuid", testStringer{"abc-123"})
-
-	fields := evt.Fields()
-	m := fieldsToMap(fields)
-
-	assertEqual(t, m["s"], "hello")
-	assertEqual(t, m["i"], 42)
-	assertEqual(t, m["i64"], int64(99))
-	assertEqual(t, m["f64"], 3.14)
-	assertEqual(t, m["b"], true)
-	assertEqual(t, m["dur"], dur)
-	assertEqual(t, m["t"], now)
-	assertEqual(t, m["err"], "boom")
-	assertEqual(t, m["uuid"], "abc-123")
+	require.Equal(t, map[string]any{
+		KeyName: "job",
+		"db":    map[string]any{"operation": "update", "rows": 3},
+	}, we.FieldsMap())
 }
 
-func TestErrNilIsNoOp(t *testing.T) {
-	evt := Begin(nil, "err_nil")
-	evt.Err("err", nil)
+func TestContextRoundTrip(t *testing.T) {
+	require.Nil(t, FromContext(t.Context()))
 
-	fields := evt.Fields()
-	m := fieldsToMap(fields)
-	if _, ok := m["err"]; ok {
-		t.Error("Err(nil) should not add a field")
-	}
+	we := Begin(nil, "job")
+	require.Same(t, we, FromContext(NewContext(t.Context(), we)))
 }
 
-func TestConvenienceBuilders(t *testing.T) {
-	evt := Begin(nil, "convenience_test")
-	evt.Success()
-	m := fieldsToMap(evt.Fields())
-	assertEqual(t, m["outcome"], "success")
+// countingError counts calls of String and Error.
+type countingError struct{ calls *int }
 
-	evt2 := Begin(nil, "failure_test")
-	evt2.Failure(errors.New("bad"))
-	m2 := fieldsToMap(evt2.Fields())
-	assertEqual(t, m2["outcome"], "failure")
-	assertEqual(t, m2["error"], "bad")
-
-	evt3 := Begin(nil, "user_test")
-	evt3.UserID(testStringer{"uid-1"}).UserName("john").UserRole("admin")
-	m3 := fieldsToMap(evt3.Fields())
-	assertEqual(t, m3["user.id"], "uid-1")
-	assertEqual(t, m3["user.name"], "john")
-	assertEqual(t, m3["user.role"], "admin")
+func (stringer countingError) String() string {
+	*stringer.calls++
+	return "id"
 }
 
-func TestSetWithDotKeys(t *testing.T) {
-	evt := Begin(nil, "dot_test")
-	evt.Set("db.operation", "update").Set("db.entity", "user")
+func (stringer countingError) Error() string { return stringer.String() }
 
-	m := fieldsToMap(evt.Fields())
-	assertEqual(t, m["db.operation"], "update")
-	assertEqual(t, m["db.entity"], "user")
-}
+func TestNilEventCallsNoValueMethods(t *testing.T) {
+	calls := 0
+	var we *Event
 
-func TestHasError(t *testing.T) {
-	evt := Begin(nil, "err_test")
-	if evt.HasError() {
-		t.Error("new event should not have error")
-	}
+	we.UUID("id", countingError{&calls}).UserID(countingError{&calls}).Err("error", countingError{&calls})
 
-	evt.Failure(errors.New("fail"))
-	if !evt.HasError() {
-		t.Error("event with failure should have error")
-	}
-
-	evt2 := Begin(nil, "status_test")
-	evt2.Set("response.status", 500)
-	if !evt2.HasError() {
-		t.Error("event with status 500 should have error")
-	}
-
-	evt3 := Begin(nil, "ok_test")
-	evt3.Set("response.status", 200)
-	if evt3.HasError() {
-		t.Error("event with status 200 should not have error")
-	}
-}
-
-func TestStatusCode(t *testing.T) {
-	evt := Begin(nil, "code_test")
-	if evt.StatusCode() != 0 {
-		t.Error("new event should have status 0")
-	}
-
-	evt.Set("response.status", 404)
-	if evt.StatusCode() != 404 {
-		t.Errorf("expected 404, got %d", evt.StatusCode())
-	}
-}
-
-func TestBeginEmitLifecycle(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
-
-	evt := Begin(emitter, "lifecycle_test")
-	evt.Str("key", "value")
-	time.Sleep(5 * time.Millisecond)
-	evt.Emit()
-
-	output := buf.String()
-	if output == "" {
-		t.Error("expected output after Emit()")
-	}
-
-	// Duration should be present
-	if !containsString(output, "duration") {
-		t.Error("expected duration field in output")
-	}
-}
-
-func TestEmitOnlyOnce(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
-
-	evt := Begin(emitter, "once_test")
-	evt.Emit()
-	first := buf.String()
-
-	evt.Emit()
-	second := buf.String()
-
-	if first != second {
-		t.Error("second Emit() should be a no-op")
-	}
-}
-
-// helpers
-
-func fieldsToMap(fields []Field) map[string]any {
-	m := make(map[string]any)
-	for _, f := range fields {
-		m[f.Key] = f.Value
-	}
-	return m
-}
-
-func assertEqual(t *testing.T, got, want any) {
-	t.Helper()
-	if got != want {
-		t.Errorf("got %v (%T), want %v (%T)", got, got, want, want)
-	}
-}
-
-func containsString(haystack, needle string) bool {
-	return len(haystack) > 0 && len(needle) > 0 && // avoid trivial matches
-		fmt.Sprintf("%s", haystack) != "" &&
-		stringContains(haystack, needle)
-}
-
-func stringContains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-func TestStatusCodeAndHasErrorUseLatest(t *testing.T) {
-	evt := Begin(nil, "latest_test")
-	evt.Set("response.status", 200).Set("response.status", 503)
-	if evt.StatusCode() != 503 {
-		t.Errorf("expected latest status 503, got %d", evt.StatusCode())
-	}
-
-	evt2 := Begin(nil, "latest_ok_test")
-	evt2.Set("response.status", 500).Set("response.status", 200)
-	if evt2.HasError() {
-		t.Error("latest status 200 should not count as error")
-	}
+	require.Zero(t, calls)
 }

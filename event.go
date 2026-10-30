@@ -4,186 +4,228 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/govengers/wide-event-logger/internal/safetext"
 )
 
-// Field represents a single key-value pair in a wide event.
+// Keys of the fields this package reads itself: HasError, StatusCode and the emitters interpret them.
+const (
+	KeyName           = "name"
+	KeyOutcome        = "outcome"
+	KeyError          = "error"
+	KeyDuration       = "duration"
+	KeyRequestMethod  = "request.method"
+	KeyRequestPath    = "request.path"
+	KeyResponseStatus = "response.status"
+)
+
+// Values of the outcome field, set by Success and Failure.
+const (
+	OutcomeSuccess = "success"
+	OutcomeFailure = "failure"
+)
+
+// minimumServerErrorStatus is the first response status HasError counts as an error.
+const minimumServerErrorStatus = 500
+
+// initialFieldCapacity fits a typical HTTP request event without growing.
+const initialFieldCapacity = 32
+
+// Field is one key-value pair of an event. Dots in the key nest the value in the JSON output.
 type Field struct {
 	Key   string
 	Value any
 }
 
-// Event represents a single wide event that accumulates structured fields
-// throughout a unit of work and emits them as one rich log line.
+// Event accumulates the fields of one unit of work and emits them once. Setting a key again replaces its
+// value; fields keep the order in which their keys were first set. All methods are safe for concurrent use
+// and do nothing on a nil *Event. After Emit the event is frozen: later writes are dropped, so work that
+// outlives the unit of work needs its own event.
+//
+// Reserved keys: the key segment "_value" holds the value of a key that is also a prefix of other keys
+// (see FieldsMap), and the JSON emitter writes the root keys "level" and "message" itself.
 type Event struct {
-	mu        sync.Mutex
-	fields    []Field
+	mutex     sync.Mutex
+	values    map[string]any
+	keys      []string // in the order they were first set
 	emitter   Emitter
 	startTime time.Time
 	emitted   bool
 }
 
-// Begin creates a new standalone event for background tasks or cron jobs.
-// The caller is responsible for calling Emit() when the work is done.
+// Begin starts an event named name that Emit hands to emitter. A nil emitter discards the event.
+// The caller ends the unit of work with Emit, usually deferred.
 func Begin(emitter Emitter, name string) *Event {
-	e := &Event{
-		fields:    make([]Field, 0, 32),
+	we := &Event{
+		values:    make(map[string]any, initialFieldCapacity),
+		keys:      make([]string, 0, initialFieldCapacity),
 		emitter:   emitter,
 		startTime: time.Now(),
 	}
-	e.fields = append(e.fields, Field{Key: "name", Value: name})
-	return e
+	return we.String(KeyName, name)
 }
 
-// Emit finalizes the event and sends it to the emitter.
-// Automatically sets the duration field. Safe to call multiple times; only the first call emits.
-func (e *Event) Emit() {
-	e.mu.Lock()
-	if e.emitted {
-		e.mu.Unlock()
+// Emit sets the duration since Begin and hands the event to its emitter. Only the first call emits.
+func (we *Event) Emit() {
+	if we == nil {
 		return
 	}
-	e.emitted = true
-	dur := time.Since(e.startTime)
-	e.fields = append(e.fields, Field{Key: "duration", Value: dur})
-	e.mu.Unlock()
+	we.mutex.Lock()
+	if we.emitted {
+		we.mutex.Unlock()
+		return
+	}
+	we.put(KeyDuration, time.Since(we.startTime))
+	we.emitted = true
+	we.mutex.Unlock()
 
-	if e.emitter != nil {
-		e.emitter.Emit(e)
+	if we.emitter != nil {
+		we.emitter.Emit(we)
 	}
 }
 
-// Set adds a field with any value. The key can contain dots for nested JSON output.
-func (e *Event) Set(key string, value any) *Event {
-	e.mu.Lock()
-	e.fields = append(e.fields, Field{Key: key, Value: value})
-	e.mu.Unlock()
-	return e
-}
-
-// Str adds a string field.
-func (e *Event) Str(key, value string) *Event {
-	return e.Set(key, value)
-}
-
-// Int adds an int field.
-func (e *Event) Int(key string, value int) *Event {
-	return e.Set(key, value)
-}
-
-// Int64 adds an int64 field.
-func (e *Event) Int64(key string, value int64) *Event {
-	return e.Set(key, value)
-}
-
-// Float64 adds a float64 field.
-func (e *Event) Float64(key string, value float64) *Event {
-	return e.Set(key, value)
-}
-
-// Bool adds a bool field.
-func (e *Event) Bool(key string, value bool) *Event {
-	return e.Set(key, value)
-}
-
-// Dur adds a time.Duration field.
-func (e *Event) Dur(key string, value time.Duration) *Event {
-	return e.Set(key, value)
-}
-
-// Time adds a time.Time field.
-func (e *Event) Time(key string, value time.Time) *Event {
-	return e.Set(key, value)
-}
-
-// Err adds an error field. If err is nil, this is a no-op.
-func (e *Event) Err(key string, err error) *Event {
-	if err == nil {
-		return e
+// Set records value under key, replacing an earlier value of the same key.
+func (we *Event) Set(key string, value any) *Event {
+	if we == nil {
+		return nil
 	}
-	return e.Set(key, err.Error())
-}
-
-// Interface adds a field with any value (alias for Set).
-func (e *Event) Interface(key string, value any) *Event {
-	return e.Set(key, value)
-}
-
-// UUID adds a field from any fmt.Stringer (typically a UUID type).
-func (e *Event) UUID(key string, value fmt.Stringer) *Event {
-	return e.Set(key, value.String())
-}
-
-// Success sets the outcome field to "success".
-func (e *Event) Success() *Event {
-	return e.Set("outcome", "success")
-}
-
-// Failure sets the outcome field to "failure" and records the error.
-func (e *Event) Failure(err error) *Event {
-	e.Set("outcome", "failure")
-	if err != nil {
-		e.Set("error", err.Error())
+	we.mutex.Lock()
+	defer we.mutex.Unlock()
+	if !we.emitted {
+		we.put(key, value)
 	}
-	return e
+	return we
 }
 
-// UserID sets the user.id field from any fmt.Stringer.
-func (e *Event) UserID(id fmt.Stringer) *Event {
-	return e.Set("user.id", id.String())
-}
-
-// UserName sets the user.name field.
-func (e *Event) UserName(name string) *Event {
-	return e.Set("user.name", name)
-}
-
-// UserRole sets the user.role field.
-func (e *Event) UserRole(role string) *Event {
-	return e.Set("user.role", role)
-}
-
-// HasError returns true if the event has an outcome of "failure" or a response status >= 500.
-// Like the emitted output, it reads the latest value of each field.
-func (e *Event) HasError() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.last("outcome") == "failure" {
-		return true
+// put stores a value. The caller holds the mutex.
+func (we *Event) put(key string, value any) {
+	if _, exists := we.values[key]; !exists {
+		we.keys = append(we.keys, key)
 	}
-	code, ok := e.last("response.status").(int)
-	return ok && code >= 500
+	we.values[key] = value
 }
 
-// StatusCode returns the latest response status code, or 0 if not set.
-func (e *Event) StatusCode() int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	code, _ := e.last("response.status").(int)
-	return code
+// String records a string.
+func (we *Event) String(key, value string) *Event {
+	return we.Set(key, value)
 }
 
-// last returns the latest value set for key, or nil. Later fields win, matching the
-// emitted output. The caller must hold e.mu.
-func (e *Event) last(key string) any {
-	for i := len(e.fields) - 1; i >= 0; i-- {
-		if e.fields[i].Key == key {
-			return e.fields[i].Value
-		}
+// Int records an int.
+func (we *Event) Int(key string, value int) *Event {
+	return we.Set(key, value)
+}
+
+// Int64 records an int64.
+func (we *Event) Int64(key string, value int64) *Event {
+	return we.Set(key, value)
+}
+
+// Float64 records a float64. The JSON emitter writes NaN and infinities as strings.
+func (we *Event) Float64(key string, value float64) *Event {
+	return we.Set(key, value)
+}
+
+// Bool records a bool.
+func (we *Event) Bool(key string, value bool) *Event {
+	return we.Set(key, value)
+}
+
+// Duration records a duration. The JSON emitter writes it in milliseconds.
+func (we *Event) Duration(key string, value time.Duration) *Event {
+	return we.Set(key, value)
+}
+
+// Time records a point in time. The JSON emitter writes it in RFC 3339 with nanoseconds.
+func (we *Event) Time(key string, value time.Time) *Event {
+	return we.Set(key, value)
+}
+
+// Err records the message of err. A nil err records nothing; an Error method that panics, such as on a nil
+// receiver, records "!panicked <type>".
+func (we *Event) Err(key string, err error) *Event {
+	if we == nil || err == nil {
+		return we
 	}
-	return nil
+	return we.Set(key, safetext.Of(err, err.Error))
 }
 
-// Fields returns a snapshot copy of all fields.
-func (e *Event) Fields() []Field {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	cp := make([]Field, len(e.fields))
-	copy(cp, e.fields)
-	return cp
+// UUID records the text of value, typically a UUID. A nil value records nothing; a String method that
+// panics records "!panicked <type>".
+func (we *Event) UUID(key string, value fmt.Stringer) *Event {
+	if we == nil || value == nil {
+		return we
+	}
+	return we.Set(key, safetext.Of(value, value.String))
 }
 
-// FieldsMap returns all fields as a nested map, expanding dot-separated keys.
-// This is a convenience method for custom emitters that need structured data.
-func (e *Event) FieldsMap() map[string]any {
-	return nestFields(e.Fields())
+// Success sets the outcome to "success".
+func (we *Event) Success() *Event {
+	return we.Set(KeyOutcome, OutcomeSuccess)
+}
+
+// Failure sets the outcome to "failure" and records the message of err as error, if err is not nil.
+func (we *Event) Failure(err error) *Event {
+	return we.Set(KeyOutcome, OutcomeFailure).Err(KeyError, err)
+}
+
+// UserID records user.id from the text of id, typically a UUID.
+func (we *Event) UserID(id fmt.Stringer) *Event {
+	return we.UUID("user.id", id)
+}
+
+// UserName records user.name.
+func (we *Event) UserName(name string) *Event {
+	return we.Set("user.name", name)
+}
+
+// UserRole records user.role.
+func (we *Event) UserRole(role string) *Event {
+	return we.Set("user.role", role)
+}
+
+// HasError reports whether the outcome is "failure" or the response status is 500 or higher. A failure
+// handled locally (recorded with Err only) is not an error here; mark it with a field a SamplerFunc reads.
+func (we *Event) HasError() bool {
+	if we == nil {
+		return false
+	}
+	we.mutex.Lock()
+	defer we.mutex.Unlock()
+	return we.values[KeyOutcome] == OutcomeFailure || we.statusCode() >= minimumServerErrorStatus
+}
+
+// StatusCode returns the response status, or 0 if none was recorded with an int value.
+func (we *Event) StatusCode() int {
+	if we == nil {
+		return 0
+	}
+	we.mutex.Lock()
+	defer we.mutex.Unlock()
+	return we.statusCode()
+}
+
+// statusCode reads the response status. The caller holds the mutex.
+func (we *Event) statusCode() int {
+	status, _ := we.values[KeyResponseStatus].(int)
+	return status
+}
+
+// Fields returns a copy of the fields in the order their keys were first set.
+func (we *Event) Fields() []Field {
+	if we == nil {
+		return nil
+	}
+	we.mutex.Lock()
+	defer we.mutex.Unlock()
+	fields := make([]Field, len(we.keys))
+	for index, key := range we.keys {
+		fields[index] = Field{Key: key, Value: we.values[key]}
+	}
+	return fields
+}
+
+// FieldsMap returns the fields as nested maps, expanding dot-separated keys, for custom emitters. A key
+// that is also the prefix of other keys keeps its value under "_value": {"db": {"_value": "pg", "operation": "update"}}.
+func (we *Event) FieldsMap() map[string]any {
+	return nestFields(we.Fields())
 }

@@ -1,14 +1,22 @@
 package wideevent
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/mattn/go-isatty"
+
+	"github.com/govengers/wide-event-logger/internal/safetext"
 )
 
 // ANSI escape codes for terminal colors.
@@ -22,489 +30,465 @@ const (
 	ansiCyan   = "\033[36m"
 )
 
-// DevEmitterOption configures a dev emitter.
-type DevEmitterOption func(*devEmitterConfig)
-
-// categoryRule maps a named category to a set of path prefixes.
-type categoryRule struct {
-	name     string
-	prefixes []string
-}
-
-type devEmitterConfig struct {
-	color              *bool // nil = auto-detect
-	categories         []categoryRule
-	muteCategories     map[string]bool
-	durationWarn       *time.Duration
-	durationError      *time.Duration
-}
-
-// WithColor forces color output on or off, overriding TTY auto-detection.
-func WithColor(enabled bool) DevEmitterOption {
-	return func(cfg *devEmitterConfig) {
-		cfg.color = &enabled
-	}
-}
-
-// WithCategory groups request paths under a named category using prefix matching.
-// Events whose request.path starts with any of the given prefixes are assigned to this category.
-// Categories can be displayed in the header and selectively muted via WithMuteCategories.
-func WithCategory(name string, pathPrefixes ...string) DevEmitterOption {
-	return func(cfg *devEmitterConfig) {
-		cfg.categories = append(cfg.categories, categoryRule{name: name, prefixes: pathPrefixes})
-	}
-}
-
-// WithDurationThresholds configures the color scale for duration values in the footer.
-// Durations below warn are green, between warn and err are yellow, at or above err are red.
-// Default thresholds are 500ms (warn) and 2s (error).
-func WithDurationThresholds(warn, err time.Duration) DevEmitterOption {
-	return func(cfg *devEmitterConfig) {
-		cfg.durationWarn = &warn
-		cfg.durationError = &err
-	}
-}
-
-// WithMuteCategories silently drops events belonging to the named categories from dev output.
-// Events in muted categories produce no output at all.
-func WithMuteCategories(names ...string) DevEmitterOption {
-	return func(cfg *devEmitterConfig) {
-		if cfg.muteCategories == nil {
-			cfg.muteCategories = make(map[string]bool)
-		}
-		for _, n := range names {
-			cfg.muteCategories[n] = true
-		}
-	}
-}
-
-// DevStdoutEmitter returns an Emitter that writes human-readable, colorized
-// wide events to stdout using unicode tree-line formatting.
-// Colors are auto-detected based on whether stdout is a terminal.
-func DevStdoutEmitter(opts ...DevEmitterOption) Emitter {
-	autoColor := isatty.IsTerminal(os.Stdout.Fd()) || isatty.IsCygwinTerminal(os.Stdout.Fd())
-	return newDevEmitter(os.Stdout, autoColor, opts...)
-}
-
-// DevWriterEmitter returns a dev emitter that writes to the given writer.
-// Colors are disabled by default; use WithColor(true) to force them on.
-func DevWriterEmitter(w io.Writer, opts ...DevEmitterOption) Emitter {
-	return newDevEmitter(w, false, opts...)
-}
-
-func newDevEmitter(w io.Writer, defaultColor bool, opts ...DevEmitterOption) Emitter {
-	cfg := &devEmitterConfig{}
-	for _, opt := range opts {
-		opt(cfg)
-	}
-	useColor := defaultColor
-	if cfg.color != nil {
-		useColor = *cfg.color
-	}
-	durationWarn := defaultDurationWarn
-	if cfg.durationWarn != nil {
-		durationWarn = *cfg.durationWarn
-	}
-	durationError := defaultDurationError
-	if cfg.durationError != nil {
-		durationError = *cfg.durationError
-	}
-	return &devEmitter{
-		w:              w,
-		color:          useColor,
-		categories:     cfg.categories,
-		muteCategories: cfg.muteCategories,
-		durationWarn:   durationWarn,
-		durationError:  durationError,
-	}
-}
-
+// Default duration thresholds of the dev emitter's footer colors.
 const (
-	defaultDurationWarn  = 500 * time.Millisecond
-	defaultDurationError = 2 * time.Second
+	defaultSlowDuration     = 500 * time.Millisecond
+	defaultVerySlowDuration = 2 * time.Second
 )
 
-type devEmitter struct {
-	w              io.Writer
-	color          bool
-	categories     []categoryRule
-	muteCategories map[string]bool
-	durationWarn   time.Duration
-	durationError  time.Duration
+// Layout of the dev emitter's lines: "┌ <time>  <title>", "│  <label padded to labelWidth><key=value  key=value ...>", "└ <footer>".
+const (
+	headerMarker     = "┌ "
+	gutter           = "│"
+	footerMarker     = "└ "
+	maximumLineWidth = 90
+	labelWidth       = 10
+	bodyIndent       = 3 // gutter and two spaces
+	pairSeparator    = "  "
+	devTimeLayout    = "15:04:05.000"
+)
+
+// ColorMode selects whether the dev emitter writes ANSI colors.
+type ColorMode int
+
+// Color modes of the dev emitter.
+const (
+	ColorAuto   ColorMode = iota // colors when the writer is a terminal
+	ColorAlways                  // colors regardless of the writer
+	ColorNever                   // plain text
+)
+
+// Category names the requests whose path starts with one of PathPrefixes. The dev emitter shows the name
+// in the header and can mute the category.
+type Category struct {
+	Name         string
+	PathPrefixes []string
 }
 
-// Fields shown in the header/footer lines, excluded from the grouped body.
-var headerFooterKeys = map[string]bool{
-	"request.method":      true,
-	"request.path":        true,
-	"response.status":     true,
-	"response.latency_ms": true,
-	"name":                true,
-	"outcome":             true,
-	"error":               true,
-	"duration":            true,
+// DevEmitterOptions configures a DevEmitter.
+type DevEmitterOptions struct {
+	// Writer receives the formatted events. Default: os.Stdout.
+	Writer io.Writer
+	// Color selects ANSI colors. Default: ColorAuto.
+	Color ColorMode
+	// Categories are matched in order against request.path; the first match wins.
+	Categories []Category
+	// MutedCategories names categories whose events are not written at all, such as health checks.
+	MutedCategories []string
+	// SlowDuration colors the duration yellow from this value on. Default: 500ms.
+	SlowDuration time.Duration
+	// VerySlowDuration colors the duration red from this value on. Default: 2s, or SlowDuration if larger.
+	VerySlowDuration time.Duration
 }
 
-func (d *devEmitter) Emit(evt *Event) {
-	fields := evt.Fields()
-	level := inferLevel(evt)
+// DevEmitter writes events as colorized, human-readable blocks for local development: a header with
+// method, path and status (or the event name), the fields grouped by their first key segment, and a
+// footer with outcome, error and duration. Control characters in keys and values are escaped, so a
+// request cannot forge lines or send escape sequences to the terminal. It is safe for concurrent use.
+// Use NewJSONEmitter in deployed environments.
+type DevEmitter struct {
+	mutex            sync.Mutex
+	writer           io.Writer
+	color            bool
+	categories       []Category
+	muted            map[string]struct{}
+	slowDuration     time.Duration
+	verySlowDuration time.Duration
+}
 
-	// Extract well-known fields for header and footer.
-	var (
-		method, path, name, outcome, errMsg string
-		status                              int
-		latencyMs                           float64
-		duration                            time.Duration
-		hasDuration                         bool
-	)
-	for _, f := range fields {
-		switch f.Key {
-		case "request.method":
-			method, _ = f.Value.(string)
-		case "request.path":
-			path, _ = f.Value.(string)
-		case "response.status":
-			status, _ = f.Value.(int)
-		case "response.latency_ms":
-			latencyMs, _ = f.Value.(float64)
-		case "name":
-			name, _ = f.Value.(string)
-		case "outcome":
-			outcome, _ = f.Value.(string)
-		case "error":
-			errMsg, _ = f.Value.(string)
-		case "duration":
-			if dur, ok := f.Value.(time.Duration); ok {
-				duration = dur
-				hasDuration = true
-			}
-		}
+// NewDevEmitter returns a DevEmitter. A nil options writes to os.Stdout with the defaults. It returns an
+// error for an unknown color mode, a category without a name, a muted category that is not declared,
+// or a negative or inverted duration threshold.
+func NewDevEmitter(options *DevEmitterOptions) (*DevEmitter, error) {
+	var resolved DevEmitterOptions
+	if options != nil {
+		resolved = *options
+	}
+	if resolved.Writer == nil {
+		resolved.Writer = os.Stdout
+	}
+	if resolved.SlowDuration == 0 {
+		resolved.SlowDuration = defaultSlowDuration
+	}
+	if resolved.VerySlowDuration == 0 {
+		resolved.VerySlowDuration = max(defaultVerySlowDuration, resolved.SlowDuration)
+	}
+	if err := validateDevEmitterOptions(&resolved); err != nil {
+		return nil, err
+	}
+	color, err := useColor(resolved.Color, resolved.Writer)
+	if err != nil {
+		return nil, err
 	}
 
-	// Match category and check muting.
-	category := d.matchCategory(path)
-	if category != "" && d.muteCategories[category] {
+	muted := make(map[string]struct{}, len(resolved.MutedCategories))
+	for _, name := range resolved.MutedCategories {
+		muted[name] = struct{}{}
+	}
+	categories := make([]Category, len(resolved.Categories))
+	for index, category := range resolved.Categories {
+		categories[index] = Category{Name: category.Name, PathPrefixes: slices.Clone(category.PathPrefixes)}
+	}
+	return &DevEmitter{
+		writer:           resolved.Writer,
+		color:            color,
+		categories:       categories,
+		muted:            muted,
+		slowDuration:     resolved.SlowDuration,
+		verySlowDuration: resolved.VerySlowDuration,
+	}, nil
+}
+
+// Emit writes we as one block, unless its category is muted.
+func (emitter *DevEmitter) Emit(we *Event) {
+	fields := we.Fields()
+	eventSummary := summarize(fields)
+	category := emitter.categoryOf(eventSummary.path)
+	if _, muted := emitter.muted[category]; muted {
 		return
 	}
 
-	// Build grouped fields, excluding header/footer fields.
-	groups, ungrouped := d.groupFields(fields)
-
-	var b strings.Builder
-
-	// Header: ┌ METHOD PATH  [category]  STATUS  LATENCYms
-	d.writeHeader(&b, level, method, path, name, category, status, latencyMs)
-
-	// Body: grouped field sections
-	hasBody := len(groups) > 0 || len(ungrouped) > 0
-	if hasBody {
-		d.writeDim(&b, "│")
-		b.WriteByte('\n')
-		d.writeGroupedBody(&b, groups, ungrouped)
-		d.writeDim(&b, "│")
-		b.WriteByte('\n')
+	var builder strings.Builder
+	emitter.writeHeader(&builder, levelOf(we), eventSummary, category)
+	if groups := groupFields(fields); len(groups) > 0 {
+		emitter.writeDim(&builder, gutter)
+		builder.WriteByte('\n')
+		for _, group := range groups {
+			emitter.writeGroup(&builder, group)
+		}
+		emitter.writeDim(&builder, gutter)
+		builder.WriteByte('\n')
 	}
+	emitter.writeFooter(&builder, eventSummary)
+	builder.WriteByte('\n')
 
-	// Footer: └ outcome=success  duration=12.5ms
-	d.writeFooter(&b, outcome, errMsg, hasDuration, duration)
-
-	b.WriteByte('\n')
-	fmt.Fprint(d.w, b.String())
+	emitter.mutex.Lock()
+	defer emitter.mutex.Unlock()
+	_, _ = io.WriteString(emitter.writer, builder.String()) // a failed write loses this event only
 }
 
-// fieldEntry is a field with its display key (prefix stripped).
-type fieldEntry struct {
-	displayKey string
-	value      any
-}
-
-func (d *devEmitter) groupFields(fields []Field) (orderedGroups []groupEntry, ungrouped []fieldEntry) {
-	groupMap := make(map[string][]fieldEntry)
-	var groupOrder []string
-	seen := make(map[string]bool)
-
-	for _, f := range fields {
-		if headerFooterKeys[f.Key] {
-			continue
-		}
-
-		dotIdx := strings.IndexByte(f.Key, '.')
-		if dotIdx < 0 {
-			ungrouped = append(ungrouped, fieldEntry{displayKey: f.Key, value: f.Value})
-			continue
-		}
-
-		prefix := f.Key[:dotIdx]
-		suffix := f.Key[dotIdx+1:]
-		groupMap[prefix] = append(groupMap[prefix], fieldEntry{displayKey: suffix, value: f.Value})
-		if !seen[prefix] {
-			seen[prefix] = true
-			groupOrder = append(groupOrder, prefix)
-		}
-	}
-
-	// Stable order: request, response, user first, then remaining in insertion order.
-	priority := map[string]int{"request": 0, "response": 1, "user": 2}
-	sort.SliceStable(groupOrder, func(i, j int) bool {
-		pi, oki := priority[groupOrder[i]]
-		pj, okj := priority[groupOrder[j]]
-		if oki && okj {
-			return pi < pj
-		}
-		if oki {
-			return true
-		}
-		if okj {
-			return false
-		}
-		return false // keep insertion order for the rest
-	})
-
-	for _, prefix := range groupOrder {
-		orderedGroups = append(orderedGroups, groupEntry{prefix: prefix, fields: groupMap[prefix]})
-	}
-	return orderedGroups, ungrouped
-}
-
-type groupEntry struct {
-	prefix string
-	fields []fieldEntry
-}
-
-// matchCategory returns the category name for a path, or "" if none match.
-func (d *devEmitter) matchCategory(path string) string {
-	for _, rule := range d.categories {
-		for _, prefix := range rule.prefixes {
+// categoryOf returns the name of the first category with a prefix of path, or "".
+func (emitter *DevEmitter) categoryOf(path string) string {
+	for _, category := range emitter.categories {
+		for _, prefix := range category.PathPrefixes {
 			if strings.HasPrefix(path, prefix) {
-				return rule.name
+				return category.Name
 			}
 		}
 	}
 	return ""
 }
 
-func (d *devEmitter) writeHeader(b *strings.Builder, level, method, path, name, category string, status int, latencyMs float64) {
-	levelColor := d.levelColor(level)
-	d.writeColor(b, levelColor+ansiBold)
-	b.WriteString("┌ ")
-	d.writeColor(b, ansiReset)
-	d.writeDim(b, time.Now().Format("15:04:05.000"))
-	b.WriteString("  ")
-	d.writeColor(b, levelColor+ansiBold)
+// writeHeader writes "┌ 15:04:05.000  METHOD PATH  [category]  STATUS", or the event name for an event
+// that is not an HTTP request.
+func (emitter *DevEmitter) writeHeader(builder *strings.Builder, level string, eventSummary summary, category string) {
+	levelColor := levelColors[level]
+	emitter.writeColored(builder, levelColor+ansiBold, headerMarker)
+	emitter.writeDim(builder, time.Now().Format(devTimeLayout))
+	builder.WriteString(pairSeparator)
 
-	if method != "" && path != "" {
-		b.WriteString(method)
-		b.WriteByte(' ')
-		b.WriteString(path)
-		d.writeColor(b, ansiReset)
-
-		if category != "" {
-			b.WriteString("  ")
-			d.writeDim(b, "["+category+"]")
+	if eventSummary.method == "" || eventSummary.path == "" {
+		title := eventSummary.name
+		if title == "" {
+			title = defaultEventMessage
 		}
-
-		if status > 0 {
-			b.WriteString("  ")
-			d.writeColor(b, d.statusColor(status)+ansiBold)
-			fmt.Fprintf(b, "%d", status)
-			d.writeColor(b, ansiReset)
-		}
-		if latencyMs > 0 {
-			b.WriteString("  ")
-			fmt.Fprintf(b, "%.1fms", latencyMs)
-		}
-	} else if name != "" {
-		b.WriteString(name)
-		d.writeColor(b, ansiReset)
-	} else {
-		b.WriteString("wide_event")
-		d.writeColor(b, ansiReset)
+		emitter.writeColored(builder, levelColor+ansiBold, printable(title))
+		builder.WriteByte('\n')
+		return
 	}
 
-	b.WriteByte('\n')
+	emitter.writeColored(builder, levelColor+ansiBold, printable(eventSummary.method+" "+eventSummary.path))
+	if category != "" {
+		builder.WriteString(pairSeparator)
+		emitter.writeDim(builder, "["+category+"]")
+	}
+	if eventSummary.status > 0 {
+		builder.WriteString(pairSeparator)
+		emitter.writeColored(builder, statusColor(eventSummary.status)+ansiBold, strconv.Itoa(eventSummary.status))
+	}
+	builder.WriteByte('\n')
 }
 
-func (d *devEmitter) writeGroupedBody(b *strings.Builder, groups []groupEntry, ungrouped []fieldEntry) {
-	for _, g := range groups {
-		d.writeGroup(b, g.prefix, g.fields)
+// writeGroup writes "│  label     key=value  key=value", wrapping at maximumLineWidth.
+func (emitter *DevEmitter) writeGroup(builder *strings.Builder, group fieldGroup) {
+	emitter.writeDim(builder, gutter)
+	builder.WriteString(pairSeparator)
+	emitter.writeColored(builder, ansiCyan, fmt.Sprintf("%-*s", labelWidth, printable(group.label)))
+
+	lineLength := bodyIndent + labelWidth
+	for index, entry := range group.entries {
+		key, value := printable(entry.Key), devFormatValue(entry.Value)
+		pairLength := len(key) + 1 + len(value)
+		exceedsLineWidth := lineLength+len(pairSeparator)+pairLength > maximumLineWidth
+		switch {
+		case index == 0:
+		case exceedsLineWidth:
+			builder.WriteByte('\n')
+			emitter.writeDim(builder, gutter)
+			builder.WriteString(strings.Repeat(" ", len(pairSeparator)+labelWidth))
+			lineLength = bodyIndent + labelWidth
+		default:
+			builder.WriteString(pairSeparator)
+			lineLength += len(pairSeparator)
+		}
+		emitter.writeDim(builder, key+"=")
+		builder.WriteString(value)
+		lineLength += pairLength
 	}
-	if len(ungrouped) > 0 {
-		d.writeUngrouped(b, ungrouped)
+	builder.WriteByte('\n')
+}
+
+// writeFooter writes "└ outcome=success  error=...  duration=12.5ms", leaving out what is not set.
+func (emitter *DevEmitter) writeFooter(builder *strings.Builder, eventSummary summary) {
+	var parts []footerPart
+	if eventSummary.outcome != "" {
+		parts = append(parts, footerPart{KeyOutcome, outcomeColors[eventSummary.outcome], printable(eventSummary.outcome)})
+	}
+	if eventSummary.errorText != "" {
+		parts = append(parts, footerPart{KeyError, ansiRed, printable(eventSummary.errorText)})
+	}
+	if eventSummary.hasDuration {
+		parts = append(parts, footerPart{KeyDuration, emitter.durationColor(eventSummary.duration), devFormatDuration(eventSummary.duration)})
+	}
+
+	emitter.writeDim(builder, footerMarker)
+	for index, part := range parts {
+		if index > 0 {
+			builder.WriteString(pairSeparator)
+		}
+		emitter.writeDim(builder, part.key+"=")
+		emitter.writeColored(builder, part.color, part.text)
+	}
+	builder.WriteByte('\n')
+}
+
+// writeColored writes text in the given color, or plain when colors are off or color is "".
+func (emitter *DevEmitter) writeColored(builder *strings.Builder, color, text string) {
+	if !emitter.color || color == "" {
+		builder.WriteString(text)
+		return
+	}
+	builder.WriteString(color)
+	builder.WriteString(text)
+	builder.WriteString(ansiReset)
+}
+
+func (emitter *DevEmitter) writeDim(builder *strings.Builder, text string) {
+	emitter.writeColored(builder, ansiDim, text)
+}
+
+func (emitter *DevEmitter) durationColor(duration time.Duration) string {
+	switch {
+	case duration >= emitter.verySlowDuration:
+		return ansiRed
+	case duration >= emitter.slowDuration:
+		return ansiYellow
+	default:
+		return ansiGreen
 	}
 }
 
-const (
-	maxLineWidth = 90
-	prefixWidth  = 10
-	bodyIndent   = 3 // "│  "
+func validateDevEmitterOptions(options *DevEmitterOptions) error {
+	if options.SlowDuration < 0 || options.VerySlowDuration < options.SlowDuration {
+		return fmt.Errorf("dev emitter: need 0 <= SlowDuration (%s) <= VerySlowDuration (%s)", options.SlowDuration, options.VerySlowDuration)
+	}
+	declared := make(map[string]struct{}, len(options.Categories))
+	for _, category := range options.Categories {
+		if category.Name == "" {
+			return errors.New("dev emitter: a category has no name")
+		}
+		declared[category.Name] = struct{}{}
+	}
+	for _, name := range options.MutedCategories {
+		if _, ok := declared[name]; !ok {
+			return fmt.Errorf("dev emitter: muted category %q is not declared in Categories", name)
+		}
+	}
+	return nil
+}
+
+func useColor(mode ColorMode, writer io.Writer) (bool, error) {
+	switch mode {
+	case ColorAuto:
+		return isTerminal(writer), nil
+	case ColorAlways:
+		return true, nil
+	case ColorNever:
+		return false, nil
+	default:
+		return false, fmt.Errorf("dev emitter: unknown color mode %d", mode)
+	}
+}
+
+func isTerminal(writer io.Writer) bool {
+	file, isFile := writer.(*os.File)
+	if !isFile {
+		return false
+	}
+	return isatty.IsTerminal(file.Fd()) || isatty.IsCygwinTerminal(file.Fd())
+}
+
+// summary holds the fields the header and footer show; they are left out of the body.
+type summary struct {
+	method, path, name, outcome, errorText string
+	status                                 int
+	duration                               time.Duration
+	hasDuration                            bool
+}
+
+// summaryKeys are the keys summarize reads.
+var summaryKeys = map[string]struct{}{
+	KeyRequestMethod: {}, KeyRequestPath: {}, KeyResponseStatus: {},
+	KeyName: {}, KeyOutcome: {}, KeyError: {}, KeyDuration: {},
+}
+
+func summarize(fields []Field) summary {
+	var result summary
+	for _, field := range fields {
+		switch field.Key {
+		case KeyRequestMethod:
+			result.method = textOf(field.Value)
+		case KeyRequestPath:
+			result.path = textOf(field.Value)
+		case KeyResponseStatus:
+			result.status, _ = field.Value.(int)
+		case KeyName:
+			result.name = textOf(field.Value)
+		case KeyOutcome:
+			result.outcome = textOf(field.Value)
+		case KeyError:
+			result.errorText = textOf(field.Value)
+		case KeyDuration:
+			result.duration, result.hasDuration = field.Value.(time.Duration)
+		}
+	}
+	return result
+}
+
+// textOf formats a value for the terminal: a string as it is, an error through its message, a number or
+// bool through fmt, anything else as its JSON, like the JSON emitter writes it (a UUID through its
+// MarshalText). fmt, or a String method promoted from an embedded field, could show json:"-" fields, and
+// fmt recurses forever on a cycle.
+func textOf(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case error:
+		return safetext.Of(typed, typed.Error)
+	case float64, float32, int, int64, bool:
+		return fmt.Sprint(typed)
+	}
+	encoded := encodeJSONValue(value, 1)
+	var unquoted string
+	if json.Unmarshal(encoded, &unquoted) == nil {
+		return unquoted // a JSON string, such as a MarshalText result or the unencodable placeholder
+	}
+	return string(encoded)
+}
+
+// fieldGroup holds the fields sharing the first key segment label, with that segment stripped. The
+// group with the empty label holds the keys without a dot.
+type fieldGroup struct {
+	label   string
+	entries []Field
+}
+
+// groupPriority puts these groups first; the rest follow in the order their first key was set, and the
+// keys without a dot come last.
+var groupPriority = map[string]int{"request": 0, "response": 1, "user": 2}
+
+func groupFields(fields []Field) []fieldGroup {
+	var groups []fieldGroup
+	positions := make(map[string]int)
+	for _, field := range fields {
+		if _, inSummary := summaryKeys[field.Key]; inSummary {
+			continue
+		}
+		label, key, _ := strings.Cut(field.Key, ".")
+		if key == "" {
+			label, key = "", field.Key
+		}
+		position, exists := positions[label]
+		if !exists {
+			position = len(groups)
+			positions[label] = position
+			groups = append(groups, fieldGroup{label: label})
+		}
+		groups[position].entries = append(groups[position].entries, Field{Key: key, Value: field.Value})
+	}
+	slices.SortStableFunc(groups, func(left, right fieldGroup) int {
+		return groupRank(left.label) - groupRank(right.label)
+	})
+	return groups
+}
+
+func groupRank(label string) int {
+	if label == "" {
+		return len(groupPriority) + 1
+	}
+	if rank, prioritized := groupPriority[label]; prioritized {
+		return rank
+	}
+	return len(groupPriority)
+}
+
+// footerPart is one key=value pair of the footer.
+type footerPart struct {
+	key, color, text string
+}
+
+var (
+	levelColors   = map[string]string{levelError: ansiRed, levelWarning: ansiYellow, levelInfo: ansiGreen}
+	outcomeColors = map[string]string{OutcomeSuccess: ansiGreen, OutcomeFailure: ansiRed}
 )
 
-func (d *devEmitter) writeGroup(b *strings.Builder, prefix string, entries []fieldEntry) {
-	d.writeDim(b, "│")
-	b.WriteString("  ")
-	d.writeColor(b, ansiCyan)
-	fmt.Fprintf(b, "%-*s", prefixWidth, prefix)
-	d.writeColor(b, ansiReset)
-
-	lineLen := bodyIndent + prefixWidth
-	for i, e := range entries {
-		plainPair := fmt.Sprintf("%s=%s", e.displayKey, devFormatValue(e.value))
-		if i > 0 && lineLen+len(plainPair)+2 > maxLineWidth {
-			b.WriteByte('\n')
-			d.writeDim(b, "│")
-			b.WriteString(strings.Repeat(" ", 2+prefixWidth))
-			lineLen = bodyIndent + prefixWidth
-		} else if i > 0 {
-			b.WriteString("  ")
-			lineLen += 2
-		}
-		d.writeKeyValue(b, e.displayKey, devFormatValue(e.value))
-		lineLen += len(plainPair)
-	}
-	b.WriteByte('\n')
-}
-
-func (d *devEmitter) writeUngrouped(b *strings.Builder, entries []fieldEntry) {
-	d.writeDim(b, "│")
-	b.WriteString(strings.Repeat(" ", 2+prefixWidth))
-	lineLen := bodyIndent + prefixWidth
-	for i, e := range entries {
-		plainPair := fmt.Sprintf("%s=%s", e.displayKey, devFormatValue(e.value))
-		if i > 0 && lineLen+len(plainPair)+2 > maxLineWidth {
-			b.WriteByte('\n')
-			d.writeDim(b, "│")
-			b.WriteString(strings.Repeat(" ", 2+prefixWidth))
-			lineLen = bodyIndent + prefixWidth
-		} else if i > 0 {
-			b.WriteString("  ")
-			lineLen += 2
-		}
-		d.writeKeyValue(b, e.displayKey, devFormatValue(e.value))
-		lineLen += len(plainPair)
-	}
-	b.WriteByte('\n')
-}
-
-func (d *devEmitter) writeFooter(b *strings.Builder, outcome, errMsg string, hasDuration bool, duration time.Duration) {
-	d.writeDim(b, "└ ")
-
-	first := true
-	if outcome != "" {
-		d.writeDim(b, "outcome=")
-		d.writeColor(b, d.outcomeColor(outcome))
-		b.WriteString(outcome)
-		d.writeColor(b, ansiReset)
-		first = false
-	}
-	if errMsg != "" {
-		if !first {
-			b.WriteString("  ")
-		}
-		d.writeDim(b, "error=")
-		d.writeColor(b, ansiRed)
-		b.WriteString(errMsg)
-		d.writeColor(b, ansiReset)
-		first = false
-	}
-	if hasDuration {
-		if !first {
-			b.WriteString("  ")
-		}
-		d.writeDim(b, "duration=")
-		d.writeColor(b, d.durationColor(duration))
-		b.WriteString(devFormatDuration(duration))
-		d.writeColor(b, ansiReset)
-	}
-	d.writeColor(b, ansiReset)
-	b.WriteByte('\n')
-}
-
-// Color helpers
-
-func (d *devEmitter) writeColor(b *strings.Builder, code string) {
-	if d.color {
-		b.WriteString(code)
-	}
-}
-
-func (d *devEmitter) writeDim(b *strings.Builder, s string) {
-	d.writeColor(b, ansiDim)
-	b.WriteString(s)
-	d.writeColor(b, ansiReset)
-}
-
-func (d *devEmitter) writeKeyValue(b *strings.Builder, key, value string) {
-	d.writeDim(b, key+"=")
-	b.WriteString(value)
-}
-
-func (d *devEmitter) levelColor(level string) string {
-	switch level {
-	case "error":
-		return ansiRed
-	case "warn":
-		return ansiYellow
-	default:
-		return ansiGreen
-	}
-}
-
-func (d *devEmitter) outcomeColor(outcome string) string {
-	switch outcome {
-	case "success":
-		return ansiGreen
-	case "error":
-		return ansiRed
-	default:
-		return ""
-	}
-}
-
-func (d *devEmitter) durationColor(dur time.Duration) string {
-	if dur >= d.durationError {
-		return ansiRed
-	}
-	if dur >= d.durationWarn {
-		return ansiYellow
-	}
-	return ansiGreen
-}
-
-func (d *devEmitter) statusColor(code int) string {
+func statusColor(status int) string {
 	switch {
-	case code >= 500:
+	case status >= minimumServerErrorStatus:
 		return ansiRed
-	case code >= 400:
+	case status >= minimumClientErrorStatus:
 		return ansiYellow
 	default:
 		return ansiGreen
 	}
 }
 
-// Value formatting for dev output
-
-func devFormatValue(v any) string {
-	switch val := v.(type) {
+func devFormatValue(value any) string {
+	switch typed := value.(type) {
 	case time.Duration:
-		return devFormatDuration(val)
+		return devFormatDuration(typed)
 	case time.Time:
-		return val.Format("15:04:05.000")
+		return typed.Format(devTimeLayout)
 	case string:
-		if val == "" {
+		if typed == "" {
 			return `""`
 		}
-		return val
+		return printable(typed)
 	default:
-		return fmt.Sprintf("%v", v)
+		return printable(textOf(value))
 	}
 }
 
-func devFormatDuration(d time.Duration) string {
-	if d < time.Millisecond {
-		return fmt.Sprintf("%dµs", d.Microseconds())
+func devFormatDuration(duration time.Duration) string {
+	switch {
+	case duration < time.Millisecond:
+		return fmt.Sprintf("%dµs", duration.Microseconds())
+	case duration < time.Second:
+		return fmt.Sprintf("%.1fms", float64(duration)/float64(time.Millisecond))
+	default:
+		return fmt.Sprintf("%.2fs", duration.Seconds())
 	}
-	if d < time.Second {
-		return fmt.Sprintf("%.1fms", float64(d.Nanoseconds())/1e6)
+}
+
+// printable quotes text that contains control or other nonprinting characters or invalid UTF-8, escaping
+// them, and returns any other text as it is. A raw byte like 0x9b is a control sequence on some terminals.
+func printable(text string) string {
+	if !utf8.ValidString(text) || strings.ContainsFunc(text, isNotPrintable) {
+		return strconv.Quote(text)
 	}
-	return fmt.Sprintf("%.2fs", d.Seconds())
+	return text
+}
+
+func isNotPrintable(character rune) bool {
+	return !unicode.IsPrint(character)
 }

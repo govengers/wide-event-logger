@@ -1,37 +1,17 @@
 package wideevent
 
-import (
-	"context"
-
-	"github.com/gin-gonic/gin"
-)
+import "context"
 
 type contextKey struct{}
 
-const ginContextKey = "wideevent"
-
-// NewContext returns a new context with the event stored in it.
-func NewContext(ctx context.Context, evt *Event) context.Context {
-	return context.WithValue(ctx, contextKey{}, evt)
+// NewContext returns a copy of ctx that carries we.
+func NewContext(ctx context.Context, we *Event) context.Context {
+	return context.WithValue(ctx, contextKey{}, we)
 }
 
-// FromContext retrieves the event from a standard context.
-// Returns nil if no event is stored.
+// FromContext returns the event stored in ctx by NewContext, or nil outside a unit of work. The methods
+// of a nil *Event do nothing, so the result can be used without a nil check.
 func FromContext(ctx context.Context) *Event {
-	if evt, ok := ctx.Value(contextKey{}).(*Event); ok {
-		return evt
-	}
-	return nil
-}
-
-// FromGin retrieves the event from a Gin context.
-// It first checks the Gin key store, then falls back to the request context.
-// Returns nil if no event is found.
-func FromGin(c *gin.Context) *Event {
-	if v, ok := c.Get(ginContextKey); ok {
-		if evt, ok := v.(*Event); ok {
-			return evt
-		}
-	}
-	return FromContext(c.Request.Context())
+	we, _ := ctx.Value(contextKey{}).(*Event)
+	return we
 }

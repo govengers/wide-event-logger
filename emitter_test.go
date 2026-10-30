@@ -1,193 +1,285 @@
 package wideevent
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
-// safeBuffer is a thread-safe bytes.Buffer for tests
-type safeBuffer struct {
-	mu  sync.Mutex
-	buf []byte
+// emitJSON emits one event built by record through a JSONEmitter and returns the decoded line.
+func emitJSON(t *testing.T, record func(we *Event)) map[string]any {
+	t.Helper()
+	var buffer bytes.Buffer
+	we := Begin(NewJSONEmitter(&JSONEmitterOptions{Writer: &buffer}), "job")
+	record(we)
+	we.Emit()
+
+	require.Equal(t, 1, strings.Count(buffer.String(), "\n"), "one line per event")
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(buffer.Bytes(), &document))
+	return document
 }
 
-func (b *safeBuffer) Write(p []byte) (n int, err error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.buf = append(b.buf, p...)
-	return len(p), nil
+func TestJSONEmitterWritesNestedFieldsLevelAndMessage(t *testing.T) {
+	document := emitJSON(t, func(we *Event) {
+		we.String("db.operation", "update").String("html", "<b>").Success()
+	})
+
+	require.Equal(t, "job", document["name"])
+	require.Equal(t, "success", document["outcome"])
+	require.Equal(t, map[string]any{"operation": "update"}, document["db"])
+	require.Equal(t, "<b>", document["html"])
+	require.Equal(t, "info", document["level"])
+	require.Equal(t, "wide_event", document["message"])
+	require.Contains(t, document, "duration")
 }
 
-func (b *safeBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return string(b.buf)
+func TestJSONEmitterConvertsValues(t *testing.T) {
+	emittedAt := time.Date(2026, 10, 30, 12, 0, 0, 5, time.UTC)
+	document := emitJSON(t, func(we *Event) {
+		we.Duration("elapsed", 1500*time.Microsecond).
+			Time("at", emittedAt).
+			Set("error_value", errors.New("boom")).
+			Float64("not_a_number", math.NaN()).
+			Float64("infinite", math.Inf(1)).
+			Set("float32", float32(math.Inf(-1))).
+			Set("channel", make(chan int)).
+			Float64("ratio", 0.5)
+	})
+
+	require.InDelta(t, 1.5, document["elapsed"], 1e-9)
+	require.Equal(t, "2026-10-30T12:00:00.000000005Z", document["at"])
+	require.Equal(t, "boom", document["error_value"])
+	require.Equal(t, "NaN", document["not_a_number"])
+	require.Equal(t, "+Inf", document["infinite"])
+	require.Equal(t, "-Inf", document["float32"])
+	require.IsType(t, "", document["channel"], "an unencodable value is written as text, the event survives")
+	require.InDelta(t, 0.5, document["ratio"], 1e-9)
 }
 
-func (b *safeBuffer) Reset() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.buf = nil
+func TestJSONEmitterSurvivesANestedUnencodableValue(t *testing.T) {
+	document := emitJSON(t, func(we *Event) {
+		we.Set("nested", map[string]any{"value": math.NaN()}).String("kept", "yes")
+	})
+
+	require.Equal(t, "yes", document["kept"])
+	require.IsType(t, "", document["nested"])
 }
 
-func TestJSONOutputStructure(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
-
-	evt := Begin(emitter, "test_event")
-	evt.Str("endpoint", "get_users").Success()
-	evt.Set("response.status", 200)
-	evt.Emit()
-
-	var result map[string]any
-	if err := json.Unmarshal(buf.buf, &result); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
+func TestJSONEmitterLevel(t *testing.T) {
+	testCases := []struct {
+		name   string
+		record func(we *Event)
+		level  string
+	}{
+		{"success", func(we *Event) { we.Success() }, "info"},
+		{"client error", func(we *Event) { we.Int(KeyResponseStatus, 404) }, "warn"},
+		{"server error", func(we *Event) { we.Int(KeyResponseStatus, 502) }, "error"},
+		{"failure", func(we *Event) { we.Int(KeyResponseStatus, 200).Failure(nil) }, "error"},
 	}
-
-	if result["level"] != "info" {
-		t.Errorf("expected level 'info', got %v", result["level"])
-	}
-	if result["message"] != "wide_event" {
-		t.Errorf("expected message 'wide_event', got %v", result["message"])
-	}
-	if result["name"] != "test_event" {
-		t.Errorf("expected name 'test_event', got %v", result["name"])
-	}
-	if result["outcome"] != "success" {
-		t.Errorf("expected outcome 'success', got %v", result["outcome"])
-	}
-}
-
-func TestJSONNestedOutput(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
-
-	evt := Begin(emitter, "nested")
-	evt.Set("db.operation", "update").Set("db.entity", "user")
-	evt.Emit()
-
-	var result map[string]any
-	if err := json.Unmarshal(buf.buf, &result); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	db, ok := result["db"].(map[string]any)
-	if !ok {
-		t.Fatal("expected nested 'db' object")
-	}
-	if db["operation"] != "update" {
-		t.Errorf("expected operation 'update', got %v", db["operation"])
-	}
-	if db["entity"] != "user" {
-		t.Errorf("expected entity 'user', got %v", db["entity"])
-	}
-}
-
-func TestJSONDeepNesting(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
-
-	evt := Begin(emitter, "deep")
-	evt.Set("a.b.c.d", "value")
-	evt.Emit()
-
-	var result map[string]any
-	if err := json.Unmarshal(buf.buf, &result); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-
-	a := result["a"].(map[string]any)
-	b := a["b"].(map[string]any)
-	c := b["c"].(map[string]any)
-	if c["d"] != "value" {
-		t.Errorf("expected 'value', got %v", c["d"])
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			require.Equal(t, testCase.level, emitJSON(t, testCase.record)["level"])
+		})
 	}
 }
 
-func TestLevelInferenceError(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
+func TestJSONEmitterWritesWholeLinesConcurrently(t *testing.T) {
+	var buffer bytes.Buffer
+	emitter := NewJSONEmitter(&JSONEmitterOptions{Writer: &buffer})
+	var waitGroup sync.WaitGroup
+	for range 20 {
+		waitGroup.Go(func() { Begin(emitter, "job").String("payload", strings.Repeat("x", 1000)).Emit() })
+	}
+	waitGroup.Wait()
 
-	evt := Begin(emitter, "error")
-	evt.Set("response.status", 500)
-	evt.Emit()
-
-	var result map[string]any
-	json.Unmarshal(buf.buf, &result)
-	if result["level"] != "error" {
-		t.Errorf("expected 'error', got %v", result["level"])
+	lines := strings.Split(strings.TrimSuffix(buffer.String(), "\n"), "\n")
+	require.Len(t, lines, 20)
+	for _, line := range lines {
+		require.True(t, json.Valid([]byte(line)), line)
 	}
 }
 
-func TestLevelInferenceWarn(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
-
-	evt := Begin(emitter, "warn")
-	evt.Set("response.status", 404)
-	evt.Emit()
-
-	var result map[string]any
-	json.Unmarshal(buf.buf, &result)
-	if result["level"] != "warn" {
-		t.Errorf("expected 'warn', got %v", result["level"])
-	}
+func TestNewJSONEmitterDefaultsToStdout(t *testing.T) {
+	require.NotNil(t, NewJSONEmitter(nil).writer)
 }
 
-func TestLevelInferenceFailure(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
+func TestMultiEmitterHandsEveryEventToEachEmitter(t *testing.T) {
+	first, second := &captureEmitter{}, &captureEmitter{}
 
-	evt := Begin(emitter, "failure")
-	evt.Failure(nil)
-	// outcome = "failure" means HasError() = true
-	evt.Set("outcome", "failure")
-	evt.Emit()
+	Begin(MultiEmitter(first, second), "job").Emit()
 
-	var result map[string]any
-	json.Unmarshal(buf.buf, &result)
-	if result["level"] != "error" {
-		t.Errorf("expected 'error', got %v", result["level"])
-	}
+	require.Len(t, first.emitted(), 1)
+	require.Len(t, second.emitted(), 1)
 }
 
-func TestDurationEmittedAsMs(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
+func TestSampledEmitterSeesTheFinishedEvent(t *testing.T) {
+	capture := &captureEmitter{}
+	emitter := SampledEmitter(capture, AlwaysOnError())
 
-	evt := Begin(emitter, "dur_test")
-	evt.Dur("custom_dur", 150*time.Millisecond)
-	evt.Emit()
+	Begin(emitter, "kept").Failure(errors.New("x")).Emit()
+	Begin(emitter, "dropped").Success().Emit()
 
-	var result map[string]any
-	json.Unmarshal(buf.buf, &result)
-
-	durVal, ok := result["custom_dur"].(float64)
-	if !ok {
-		t.Fatal("duration should be a float64")
-	}
-	// 150ms = 150.0 (approximately)
-	if durVal < 140 || durVal > 160 {
-		t.Errorf("expected ~150ms, got %f", durVal)
-	}
+	events := capture.emitted()
+	require.Len(t, events, 1)
+	require.Equal(t, "kept", valuesOf(events[0])[KeyName])
 }
 
-func TestTimeEmittedAsRFC3339Nano(t *testing.T) {
-	var buf safeBuffer
-	emitter := JSONWriterEmitter(&buf)
+// credentials has a field JSON must never show and a NaN that makes JSON fail.
+type credentials struct {
+	User     string  `json:"user"`
+	Password string  `json:"-"`
+	Score    float64 `json:"score"`
+	token    string
+}
 
-	now := time.Date(2026, 2, 20, 10, 30, 0, 123456789, time.UTC)
-	evt := Begin(emitter, "time_test")
-	evt.Time("ts", now)
-	evt.Emit()
+func TestJSONEmitterFallbackShowsNoHiddenFields(t *testing.T) {
+	document := emitJSON(t, func(we *Event) {
+		we.Set("login", credentials{User: "ada", Password: "hunter2", Score: math.NaN(), token: "abc"})
+	})
 
-	var result map[string]any
-	json.Unmarshal(buf.buf, &result)
+	require.Equal(t, "!unencodable wideevent.credentials", document["login"])
+}
 
-	expected := now.Format(time.RFC3339Nano)
-	if result["ts"] != expected {
-		t.Errorf("expected %s, got %v", expected, result["ts"])
+func TestJSONEmitterSurvivesACycle(t *testing.T) {
+	cycle := map[string]any{}
+	cycle["self"] = cycle
+
+	document := emitJSON(t, func(we *Event) { we.Set("cycle", cycle).String("kept", "yes") })
+
+	require.Equal(t, "!unencodable map[string]interface {}", document["cycle"])
+	require.Equal(t, "yes", document["kept"])
+}
+
+func TestJSONEmitterReservesLevelAndMessage(t *testing.T) {
+	document := emitJSON(t, func(we *Event) { we.String("level", "debug") })
+	require.Equal(t, "info", document["level"])
+}
+
+// failingWriter writes the given number of bytes of its first writes and fails them; later writes succeed.
+type failingWriter struct {
+	bytes.Buffer
+	acceptedBytes []int
+}
+
+func (writer *failingWriter) Write(data []byte) (int, error) {
+	if len(writer.acceptedBytes) == 0 {
+		return writer.Buffer.Write(data)
 	}
+	accepted := min(writer.acceptedBytes[0], len(data))
+	writer.acceptedBytes = writer.acceptedBytes[1:]
+	written, _ := writer.Buffer.Write(data[:accepted])
+	return written, errors.New("disk full")
+}
+
+func TestJSONEmitterEndsAFragmentAfterAPartialWrite(t *testing.T) {
+	// a partial write, then a write that fails completely, then success
+	writer := &failingWriter{acceptedBytes: []int{10, 0}}
+	emitter := NewJSONEmitter(&JSONEmitterOptions{Writer: writer})
+
+	Begin(emitter, "partial").Emit()
+	Begin(emitter, "lost").Emit()
+	Begin(emitter, "kept").Emit()
+
+	lines := strings.Split(strings.TrimSuffix(writer.String(), "\n"), "\n")
+	require.Len(t, lines, 2)
+	require.False(t, json.Valid([]byte(lines[0])))
+	require.True(t, json.Valid([]byte(lines[1])), "the next event is a whole line")
+	require.Contains(t, lines[1], `"kept"`)
+}
+
+// panickingMarshaler panics in MarshalJSON.
+type panickingMarshaler struct{}
+
+func (panickingMarshaler) MarshalJSON() ([]byte, error) { panic("broken marshaler") }
+
+func TestJSONEmitterSurvivesAPanickingMarshaler(t *testing.T) {
+	document := emitJSON(t, func(we *Event) { we.Set("broken", panickingMarshaler{}).String("kept", "yes") })
+
+	require.Equal(t, "!unencodable wideevent.panickingMarshaler", document["broken"])
+	require.Equal(t, "yes", document["kept"])
+}
+
+func TestJSONEmitterSurvivesTooDeepNesting(t *testing.T) {
+	var deep any = "leaf"
+	for range 10001 {
+		deep = []any{deep}
+	}
+
+	document := emitJSON(t, func(we *Event) { we.Set("deep", deep).String("kept", "yes") })
+
+	require.Equal(t, "!unencodable []interface {}", document["deep"])
+	require.Equal(t, "yes", document["kept"])
+}
+
+// cyclicPanicMarshaler panics with a map that contains itself.
+type cyclicPanicMarshaler struct{}
+
+func (cyclicPanicMarshaler) MarshalJSON() ([]byte, error) {
+	cycle := map[string]any{}
+	cycle["self"] = cycle
+	panic(cycle)
+}
+
+func TestJSONEmitterSurvivesACyclicPanicValue(t *testing.T) {
+	document := emitJSON(t, func(we *Event) { we.Set("broken", cyclicPanicMarshaler{}) })
+	require.Equal(t, "!unencodable wideevent.cyclicPanicMarshaler", document["broken"])
+}
+
+func TestJSONEmitterCountsTheKeyPathIntoTheNestingLimit(t *testing.T) {
+	var deep any = "leaf"
+	for range 9998 {
+		deep = []any{deep}
+	}
+
+	document := emitJSON(t, func(we *Event) { we.Set("fits", deep).Set("too.deep", deep) })
+
+	require.IsType(t, []any{}, document["fits"], "9998 levels, the root object and a reserved _value level")
+	require.Equal(t, map[string]any{"deep": "!unencodable []interface {}"}, document["too"])
+}
+
+func TestJSONEmitterCountsAConflictLevelIntoTheNestingLimit(t *testing.T) {
+	var deep any = "leaf"
+	for range 9999 {
+		deep = []any{deep}
+	}
+
+	document := emitJSON(t, func(we *Event) { we.Set("a", deep).Int("a.b", 1) })
+
+	require.Equal(t, map[string]any{"_value": "!unencodable []interface {}", "b": float64(1)}, document["a"])
+}
+
+func TestJSONEmitterWritesTooDeepKeysFlat(t *testing.T) {
+	key := strings.Repeat("a.", 10000) + "b"
+
+	document := emitJSON(t, func(we *Event) { we.Int(key, 1).String("kept", "yes") })
+
+	require.Contains(t, document, key)
+	require.Equal(t, "yes", document["kept"])
+}
+
+// panickingMessageError panics in Error with a map that contains itself.
+type panickingMessageError struct{}
+
+func (panickingMessageError) Error() string {
+	cycle := map[string]any{}
+	cycle["self"] = cycle
+	panic(cycle)
+}
+
+// failingMarshaler returns an error whose Error method panics.
+type failingMarshaler struct{}
+
+func (failingMarshaler) MarshalJSON() ([]byte, error) { return nil, panickingMessageError{} }
+
+func TestJSONEmitterNeverFormatsAMarshalError(t *testing.T) {
+	document := emitJSON(t, func(we *Event) { we.Set("broken", failingMarshaler{}) })
+	require.Equal(t, "!unencodable wideevent.failingMarshaler", document["broken"])
 }

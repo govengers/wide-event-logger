@@ -1,389 +1,183 @@
-# go-wide-event-logger
+# wide-event-logger
 
-A Go library for **wide event logging** — one rich structured log line per unit of work instead of dozens of scattered `log.Info/Error/Debug` calls.
+[![CI](https://github.com/govengers/wide-event-logger/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/govengers/wide-event-logger/actions/workflows/ci.yml)
+[![unit tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/govengers/wide-event-logger/badges/unit-tests.json)](https://github.com/govengers/wide-event-logger/actions/workflows/ci.yml)
+[![e2e tests](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/govengers/wide-event-logger/badges/e2e-tests.json)](test/e2e)
+[![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/govengers/wide-event-logger/badges/coverage.json)](https://github.com/govengers/wide-event-logger/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/govengers/wide-event-logger.svg)](https://pkg.go.dev/github.com/govengers/wide-event-logger)
+[![License](https://img.shields.io/github/license/govengers/wide-event-logger)](LICENSE)
 
-## What are Wide Events?
+Wide event logging for Go: one structured event per unit of work (a request, a job, a cron run) instead of many scattered log lines.
 
-Traditional logging produces disconnected log lines:
-
-```
-INFO  Starting user update
-DEBUG Fetching user from cache
-DEBUG Cache miss, querying database
-INFO  User updated successfully
-DEBUG Broadcasting websocket event
-```
-
-Wide events replace this with **one comprehensive event** containing all context:
+Every layer adds what it did to the same event, and the event is emitted once at the end. When something goes wrong in production, the one event of that request answers what happened:
 
 ```json
 {
-  "level": "info",
+  "name": "update_product",
+  "outcome": "failure",
+  "error": "update product 0192: conflict",
+  "level": "error",
   "message": "wide_event",
-  "name": "update_user",
-  "outcome": "success",
-  "request": { "method": "PUT", "path": "/api/v1/users/abc-123" },
-  "response": { "status": 200, "latency_ms": 12.4 },
-  "user": { "id": "def-456", "name": "john", "role": "admin" },
-  "db": { "operation": "update", "entity": "user" },
-  "cache": { "hit": false }
+  "request": { "method": "PUT", "path": "/api/v1/products/0192", "query": "token=redacted", "id": "trace-1" },
+  "response": { "status": 409, "body_size": 61 },
+  "user": { "id": "0191", "role": "admin" },
+  "db": { "operation": "update", "entity": "product", "tx": "rolled_back" },
+  "duration": 6.8
 }
 ```
-
-One event per request. Every field queryable. No context lost.
 
 ## Installation
 
 ```bash
-go get github.com/mxcd/go-wide-event-logger
+go get github.com/govengers/wide-event-logger
 ```
 
-## Quick Start
+The core package `wideevent` has no web framework dependency. The Gin middleware is in the subpackage `github.com/govengers/wide-event-logger/ginadapter`.
+
+## Usage
+
+### HTTP requests (Gin)
 
 ```go
-import wideevent "github.com/mxcd/go-wide-event-logger"
-
-func main() {
-    r := gin.Default()
-    r.Use(wideevent.Middleware())
-
-    r.GET("/api/users", func(c *gin.Context) {
-        we := wideevent.FromGin(c)
-        we.Str("endpoint", "list_users").Success()
-        c.JSON(200, users)
-    })
-
-    r.Run(":8080")
-}
-```
-
-## Convention: the `we` Variable
-
-Wide events use the variable name **`we`** — it reads as natural English:
-
-```go
-we.Success()           // "we succeeded"
-we.Failure(err)        // "we failed with err"
-we.UserID(id)          // "we have user ID"
-we.UserName("john")    // "we have user name john"
-```
-
-## API Reference
-
-### Event Creation
-
-| Function | Use Case |
-|----------|----------|
-| `wideevent.FromGin(c)` | Get event from Gin handler (created by middleware) |
-| `wideevent.FromContext(ctx)` | Get event from standard context (repository layers) |
-| `wideevent.Begin(emitter, name)` | Create standalone event (background tasks, cron jobs) |
-
-### Typed Setters
-
-All setters return `*Event` for chaining:
-
-```go
-we.Str("key", "value")           // string
-we.Int("key", 42)                // int
-we.Int64("key", int64(99))       // int64
-we.Float64("key", 3.14)          // float64
-we.Bool("key", true)             // bool
-we.Dur("key", 5*time.Second)     // time.Duration (emitted as ms)
-we.Time("key", time.Now())       // time.Time (emitted as RFC3339Nano)
-we.Err("key", err)               // error (nil is a no-op)
-we.Interface("key", anything)    // any
-we.UUID("key", uuidValue)        // fmt.Stringer
-we.Set("key", anyValue)          // generic setter
-```
-
-### Convenience Builders
-
-```go
-we.Success()              // sets outcome = "success"
-we.Failure(err)           // sets outcome = "failure", error = err.Error()
-we.UserID(id)             // sets user.id
-we.UserName("john")       // sets user.name
-we.UserRole("admin")      // sets user.role
-```
-
-### Event Inspection
-
-```go
-evt.Fields()        // []wideevent.Field — snapshot of all key-value pairs
-evt.FieldsMap()     // map[string]any — nested map with dot keys expanded
-evt.HasError()      // bool — true if the latest outcome="failure" or latest status >= 500
-evt.StatusCode()    // int — latest response status code, or 0 if not set
-```
-
-### Nested Keys via Dots
-
-Keys containing dots produce nested JSON:
-
-```go
-we.Set("db.operation", "update")
-we.Set("db.entity", "user")
-// Output: {"db": {"operation": "update", "entity": "user"}}
-```
-
-## Dev Mode
-
-For local development, use `DevStdoutEmitter()` for human-readable, colorized output with unicode tree formatting:
-
-```go
-r.Use(wideevent.Middleware(
-    wideevent.WithEmitter(wideevent.DevStdoutEmitter()),
-))
-```
-
-Output:
-
-```
-┌ GET /api/v1/users/abc-123                    200  12.4ms
-│
-│  request   method=GET  path=/api/v1/users/abc-123
-│            host=localhost:8080  client_ip=127.0.0.1
-│  response  status=200  body_size=1842  latency_ms=12.4
-│  user      id=def-456  name=john  role=admin
-│  db        operation=update  entity=user
-│  cache     hit=false
-│
-└ outcome=success  duration=12.5ms
-```
-
-Colors are auto-detected based on terminal capability. Use `WithColor(true/false)` to override:
-
-```go
-wideevent.DevStdoutEmitter(wideevent.WithColor(false)) // force no color
-```
-
-Use `DevWriterEmitter` for custom output targets:
-
-```go
-wideevent.DevWriterEmitter(os.Stderr, wideevent.WithColor(true))
-```
-
-Combine with JSON for file logging using `MultiEmitter`:
-
-```go
-wideevent.WithEmitter(wideevent.MultiEmitter(
-    wideevent.DevStdoutEmitter(),          // pretty terminal output
-    wideevent.JSONWriterEmitter(logFile),   // structured JSON to file
-))
-```
-
-### Path Categories & Muting
-
-Group request paths into named categories and mute noisy ones:
-
-```go
-wideevent.DevStdoutEmitter(
-    wideevent.WithCategory("assets", "/src/assets", "/static"),
-    wideevent.WithCategory("health", "/health", "/ready"),
-    wideevent.WithCategory("api", "/api"),
-    wideevent.WithMuteCategories("assets", "health"),
-)
-```
-
-Muted categories produce no output. Non-muted categories show a label in the header:
-
-```
-┌ GET /api/v1/users/abc-123  [api]  200  12.4ms
-│
-│  ...
-└ outcome=success  duration=12.5ms
-```
-
-Categories use prefix matching — `WithCategory("assets", "/src/assets")` matches `/src/assets/logo.png`, `/src/assets/styles.css`, etc.
-
-## Setup Options
-
-```go
-r.Use(wideevent.Middleware(
-    // Custom output target (default: JSON to stdout)
-    wideevent.WithEmitter(wideevent.JSONWriterEmitter(os.Stderr)),
-
-    // Tail sampling strategy (default: AlwaysSample)
-    wideevent.WithSampler(wideevent.CompositeSampler(
-        wideevent.AlwaysOnError(),
-        wideevent.Rate(100),
-    )),
-
-    // Add fields before handler (e.g., trace ID)
-    wideevent.WithPreEnricher(func(we *wideevent.Event, c *gin.Context) {
-        we.Str("trace.id", c.GetHeader("X-Trace-ID"))
-    }),
-
-    // Add fields after handler (e.g., user context from auth)
-    wideevent.WithPostEnricher(func(we *wideevent.Event, c *gin.Context) {
-        if user := getUser(c); user != nil {
-            we.UserID(user.ID).UserName(user.Name).UserRole(user.Role)
-        }
-    }),
-
-    // Skip paths (e.g., health checks)
-    wideevent.WithSkipPaths("/health", "/ready"),
-))
-```
-
-## Examples
-
-### Gin Request Logging
-
-```go
-package main
-
 import (
-    "github.com/gin-gonic/gin"
-    wideevent "github.com/mxcd/go-wide-event-logger"
+    wideevent "github.com/govengers/wide-event-logger"
+    "github.com/govengers/wide-event-logger/ginadapter"
 )
 
 func main() {
-    r := gin.New()
-    r.Use(wideevent.Middleware(
-        wideevent.WithSkipPaths("/health"),
-        wideevent.WithPostEnricher(func(we *wideevent.Event, c *gin.Context) {
-            if u := getAuthUser(c); u != nil {
-                we.UserID(u.ID).UserName(u.Username).UserRole(string(u.Role))
-            }
-        }),
-    ))
+    middleware, err := ginadapter.NewMiddleware(&ginadapter.Options{
+        Emitter:        wideevent.NewJSONEmitter(nil), // stdout
+        SkipPaths:      []string{"/api/health"},
+        QueryAllowlist: []string{"page", "sort"},
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    r.PUT("/api/v1/users/:id", func(c *gin.Context) {
-        we := wideevent.FromGin(c)
-        we.Str("endpoint", "update_user")
-
-        id := c.Param("id")
-        user, err := updateUser(c.Request.Context(), id)
-        if err != nil {
+    engine := gin.New()
+    // or your proxies' addresses: request.client_ip trusts X-Forwarded-For only from them
+    if err := engine.SetTrustedProxies(nil); err != nil {
+        log.Fatal(err)
+    }
+    // The event records a panic and its stack; gin.Recovery would also print the raw request, cookies included.
+    recovery := gin.CustomRecoveryWithWriter(io.Discard, func(ginContext *gin.Context, _ any) {
+        ginContext.AbortWithStatus(http.StatusInternalServerError)
+    })
+    engine.Use(recovery, middleware)
+    engine.PUT("/api/v1/products/:id", func(ginContext *gin.Context) {
+        we := ginadapter.FromContext(ginContext)
+        we.String("name", "update_product")
+        if err := products.Update(ginContext.Request.Context(), ginContext.Param("id")); err != nil {
             we.Failure(err)
-            c.JSON(500, gin.H{"error": "internal"})
+            ginContext.Status(http.StatusConflict)
             return
         }
         we.Success()
-        c.JSON(200, user)
+        ginContext.Status(http.StatusNoContent)
     })
-
-    r.Run(":8080")
 }
 ```
 
-### Background Task Logging
+The middleware records `request.method`, `path`, `query`, `host`, `proto`, `content_length`, `client_ip`, `user_agent`, `id`, `start_time`, then `response.status`, `body_size`, `gin_errors` (when there are any) and the event's `duration`. It emits when the handler returns, and also when the handler or an enricher panics: the event gets `outcome=failure`, `error="panic: ..."` and status 500, `panic.stack` holds the stack, and the panic is raised again for the recovery middleware. Handlers do not call `Emit` on the request event; the middleware does. Gin's automatic trailing-slash redirects run no middleware and produce no event.
+
+- **Query redaction:** every query value is recorded as `redacted` unless its parameter is in `QueryAllowlist`, so OAuth codes, tokens and personal data in URLs stay out of the logs.
+- **Bounded size:** client-controlled text is cut (path 2048 bytes, query and user agent 512, host 256), so a request cannot inflate its event.
+- **Request ID:** `request.id` is the client's `X-Request-ID` when it is printable ASCII of at most 128 characters, otherwise a generated one. It is echoed in the `X-Request-ID` response header.
+- `PreEnricher` and `PostEnricher` add fields before and after the handler, such as the authenticated user.
+
+### Deeper layers
+
+Services and repositories find the event in the context. Outside a unit of work `FromContext` returns nil, and every method of a nil event does nothing, so no nil check is needed:
 
 ```go
-func (s *Service) SyncUsers(ctx context.Context) {
-    we := wideevent.Begin(s.emitter, "sync_users")
-    defer we.Emit()
-
-    we.Set("source", "cron").Set("trigger", "scheduled")
-
-    users, err := s.fetchExternalUsers(ctx)
-    if err != nil {
-        we.Failure(err)
-        return
-    }
-    we.Int("batch_size", len(users)).Success()
+func (r *ProductRepository) Update(ctx context.Context, product *model.Product) error {
+    wideevent.FromContext(ctx).String("db.operation", "update").String("db.entity", "product")
+    ...
 }
 ```
 
-### Repository Layer Enrichment
+### Background jobs
 
 ```go
-func (r *Repository) UpdateUser(ctx context.Context, id uuid.UUID, p *UpdateParams) (*ent.User, error) {
-    we := wideevent.FromContext(ctx)
-    if we != nil {
-        we.Set("db.operation", "update").Set("db.entity", "user")
-        we.Set("cache.hit", r.userCache.Has(id.String()))
-    }
-
-    user, err := r.client.User.UpdateOneID(id).SetUsername(p.Username).Save(ctx)
-    if err != nil && we != nil {
-        we.Set("db.error", err.Error())
-    }
-    return user, err
+func (w *Worker) handle(ctx context.Context, job *model.Job) (err error) {
+    we := wideevent.Begin(w.options.Emitter, "job."+job.Queue)
+    defer func() {
+        if err != nil {
+            we.Failure(err)
+        } else {
+            we.Success()
+        }
+        we.Emit()
+    }()
+    return w.options.Handler(wideevent.NewContext(ctx, we), job)
 }
 ```
 
-### Custom Emitter
+## The event
 
-Implement the `Emitter` interface to send events anywhere — a database, an external service, etc. Use `evt.Fields()` for raw key-value pairs or `evt.FieldsMap()` for a pre-nested `map[string]any`.
+| Method | Records |
+|--------|---------|
+| `String`, `Int`, `Int64`, `Float64`, `Bool`, `Set` | a value |
+| `Duration` | a duration (JSON: milliseconds) |
+| `Time` | a time (JSON: RFC 3339 with nanoseconds) |
+| `Err(key, err)` | the error message; nil records nothing |
+| `UUID(key, id)` | the text of any `fmt.Stringer`; nil records nothing |
+| `Success()`, `Failure(err)` | `outcome` (and `error`) |
+| `UserID`, `UserName`, `UserRole` | `user.id`, `user.name`, `user.role` |
+| `Emit()` | sets `duration` and hands the event to the emitter, once |
+
+- Name the variable `we`: `we.Success()`, `we.Failure(err)`.
+- Setting a key again replaces its value. Fields keep the order in which their keys were first set.
+- Dots nest: `db.operation` becomes `{"db": {"operation": ...}}`. A key that is also a prefix of others keeps its value under `_value`.
+- After `Emit` the event is frozen: later writes are dropped. Work that outlives the request needs its own `Begin`.
+- Reserved: the key segment `_value`, and the root keys `level` and `message`, which the JSON emitter writes itself.
+- All methods are safe for concurrent use.
+
+## Emitters
+
+| Emitter | Output |
+|---------|--------|
+| `NewJSONEmitter(&JSONEmitterOptions{Writer: w})` | one JSON line per event with `level` (`info`, `warn` for 4xx, `error` for failures and 5xx) and `message: "wide_event"`. Durations, times, errors, NaN and infinities among the field values are converted; a value JSON cannot encode at all (a channel, a cycle) becomes `"!unencodable <type>"` instead of losing the event. Default writer: stdout. |
+| `NewDevEmitter(&DevEmitterOptions{...})` | colorized blocks for a terminal, fields grouped by their first key segment, maps and structs as JSON, control characters escaped. `Categories` and `MutedCategories` label or hide requests by path prefix. |
+| `MultiEmitter(a, b)` | every event to each emitter |
+| `SampledEmitter(emitter, sampler)` | only the events the sampler keeps |
+| `EmitterFunc(func(we *Event))` | your own, for example to assert on events in tests |
+
+Use the dev emitter locally and JSON in deployed environments.
+
+### Sampling
+
+Sampling is tail sampling: the sampler sees the finished event, so it can keep every failure.
 
 ```go
-type DBLogEmitter struct {
-    db *ent.Client
-}
-
-func (e *DBLogEmitter) Emit(evt *wideevent.Event) {
-    fields := evt.FieldsMap() // nested map[string]any, dot keys already expanded
-    data, _ := json.Marshal(fields)
-    e.db.Log.Create().
-        SetLevel(fields["level"].(string)).
-        SetData(data).
-        SaveX(context.Background())
-}
-```
-
-### MultiEmitter
-
-Use `MultiEmitter` to fan out events to multiple destinations simultaneously:
-
-```go
-r.Use(wideevent.Middleware(
-    wideevent.WithEmitter(wideevent.MultiEmitter(
-        wideevent.JSONStdoutEmitter(),   // structured logs to stdout
-        &DBLogEmitter{db: client},        // persist to database
-    )),
-))
-```
-
-### Tail Sampling
-
-```go
-// Production: always keep errors, sample 1-in-100 successes
-sampler := wideevent.CompositeSampler(
-    wideevent.AlwaysOnError(),
-    wideevent.AlwaysOnStatus(429, 503),
-    wideevent.Rate(100),
+emitter := wideevent.SampledEmitter(
+    wideevent.NewJSONEmitter(nil),
+    wideevent.CompositeSampler(wideevent.AlwaysOnError(), wideevent.Rate(100)),
 )
-
-r.Use(wideevent.Middleware(
-    wideevent.WithSampler(sampler),
-))
 ```
 
-## JSON Output Format
+| Sampler | Keeps |
+|---------|-------|
+| `AlwaysSample()`, `NeverSample()` | all, none |
+| `AlwaysOnError()` | `outcome=failure` or status >= 500 |
+| `AlwaysOnStatus(codes...)` | the listed statuses |
+| `Rate(n)` | every Nth event |
+| `Probability(p)` | each event with probability p |
+| `CompositeSampler(samplers...)` | when any of them keeps |
+| `SamplerFunc(func(we *Event) bool)` | your own, for example `degraded=true` |
 
-Events are emitted as single JSON lines with:
+A failure handled locally (a fallback, recorded with `Err` only) is not an error for `AlwaysOnError`; mark it with a field such as `degraded=true` and keep it with a `SamplerFunc`.
 
-- **Nested structure**: dot-separated keys become nested objects
-- **Level inference**: `HasError()` or status >= 500 → `"error"`, status >= 400 → `"warn"`, else `"info"`
-- **Durations**: emitted as float64 milliseconds
-- **Times**: emitted as RFC3339Nano strings
-- **Message**: always `"wide_event"` for easy filtering
+## Development
 
-### Automatic Fields (Middleware)
+```bash
+just check   # lint, unit tests with coverage gate, e2e tests, govulncheck
+```
 
-**Request fields** (set before handler):
-- `request.method`, `request.path`, `request.query`, `request.host`
-- `request.proto`, `request.content_length`, `request.client_ip`
-- `request.user_agent`, `request.id`, `request.start_time`
+## Changes
 
-**Response fields** (set after handler):
-- `response.status`, `response.body_size`
-- `response.latency`, `response.latency_ms`
-- `response.gin_errors`, `response.gin_error.N`
-
-## Available Samplers
-
-| Sampler | Description |
-|---------|-------------|
-| `AlwaysSample()` | Emit every event (default) |
-| `NeverSample()` | Emit nothing |
-| `AlwaysOnError()` | Emit if event has error |
-| `AlwaysOnStatus(codes...)` | Emit if status matches |
-| `Rate(n)` | Emit every Nth event |
-| `Probability(p)` | Emit with probability p (0.0-1.0) |
-| `CompositeSampler(s...)` | Emit if ANY sampler says yes (OR logic) |
+See [CHANGELOG.md](CHANGELOG.md). Coming from `github.com/mxcd/go-wide-event-logger`: the migration guide is in the 1.0.0 entry.
 
 ## License
 
-MIT
+[MIT](LICENSE)

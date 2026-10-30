@@ -5,77 +5,79 @@ import (
 	"sync/atomic"
 )
 
-// Sampler decides whether a completed event should be emitted.
+// Sampler decides whether a finished event is emitted. Use it through SampledEmitter.
 type Sampler interface {
-	ShouldSample(evt *Event) bool
+	ShouldSample(we *Event) bool
 }
 
-// SamplerFunc is an adapter to allow the use of ordinary functions as Samplers.
-type SamplerFunc func(evt *Event) bool
+// SamplerFunc adapts a function to the Sampler interface.
+type SamplerFunc func(we *Event) bool
 
-func (f SamplerFunc) ShouldSample(evt *Event) bool { return f(evt) }
+// ShouldSample calls shouldSample(we).
+func (shouldSample SamplerFunc) ShouldSample(we *Event) bool { return shouldSample(we) }
 
-// AlwaysSample returns a sampler that always emits.
+// AlwaysSample keeps every event.
 func AlwaysSample() Sampler {
-	return SamplerFunc(func(_ *Event) bool { return true })
+	return SamplerFunc(func(*Event) bool { return true })
 }
 
-// NeverSample returns a sampler that never emits.
+// NeverSample drops every event.
 func NeverSample() Sampler {
-	return SamplerFunc(func(_ *Event) bool { return false })
+	return SamplerFunc(func(*Event) bool { return false })
 }
 
-// AlwaysOnError returns a sampler that emits if the event has an error.
+// AlwaysOnError keeps the events for which HasError is true.
 func AlwaysOnError() Sampler {
-	return SamplerFunc(func(evt *Event) bool {
-		return evt.HasError()
+	return SamplerFunc(func(we *Event) bool {
+		return we.HasError()
 	})
 }
 
-// AlwaysOnStatus returns a sampler that emits if the response status matches any of the given codes.
+// AlwaysOnStatus keeps the events whose response status is one of codes.
 func AlwaysOnStatus(codes ...int) Sampler {
-	set := make(map[int]struct{}, len(codes))
-	for _, c := range codes {
-		set[c] = struct{}{}
+	selected := make(map[int]struct{}, len(codes))
+	for _, code := range codes {
+		selected[code] = struct{}{}
 	}
-	return SamplerFunc(func(evt *Event) bool {
-		_, ok := set[evt.StatusCode()]
+	return SamplerFunc(func(we *Event) bool {
+		_, ok := selected[we.StatusCode()]
 		return ok
 	})
 }
 
-// Rate returns a sampler that emits every Nth event.
-func Rate(n int) Sampler {
-	if n <= 0 {
+// Rate keeps every Nth event, counted across all events it sees (not per second). Rate(1) keeps all,
+// zero or less keeps none. It is safe for concurrent use.
+func Rate(every int) Sampler {
+	if every <= 0 {
 		return NeverSample()
 	}
-	if n == 1 {
+	if every == 1 {
 		return AlwaysSample()
 	}
 	var counter atomic.Int64
-	return SamplerFunc(func(_ *Event) bool {
-		return counter.Add(1)%int64(n) == 0
+	return SamplerFunc(func(*Event) bool {
+		return counter.Add(1)%int64(every) == 0
 	})
 }
 
-// Probability returns a sampler that emits with the given probability (0.0 to 1.0).
-func Probability(p float64) Sampler {
-	if p <= 0 {
+// Probability keeps each event with the given probability between 0 and 1.
+func Probability(probability float64) Sampler {
+	if probability <= 0 {
 		return NeverSample()
 	}
-	if p >= 1 {
+	if probability >= 1 {
 		return AlwaysSample()
 	}
-	return SamplerFunc(func(_ *Event) bool {
-		return rand.Float64() < p
+	return SamplerFunc(func(*Event) bool {
+		return rand.Float64() < probability //nolint:gosec // G404: sampling needs no cryptographic randomness
 	})
 }
 
-// CompositeSampler returns a sampler that emits if ANY of the given samplers say yes (OR logic).
+// CompositeSampler keeps an event when any of samplers keeps it.
 func CompositeSampler(samplers ...Sampler) Sampler {
-	return SamplerFunc(func(evt *Event) bool {
-		for _, s := range samplers {
-			if s.ShouldSample(evt) {
+	return SamplerFunc(func(we *Event) bool {
+		for _, sampler := range samplers {
+			if sampler.ShouldSample(we) {
 				return true
 			}
 		}
