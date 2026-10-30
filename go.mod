@@ -1,3 +1,4 @@
+// Deprecated: moved to github.com/govengers/wide-event-logger; v1.0.0 and later are published only there.
 module github.com/mxcd/go-wide-event-logger
 
 go 1.25.0
