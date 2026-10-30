@@ -276,7 +276,7 @@ func TestMiddlewareRecordsAPanicAndRaisesItAgain(t *testing.T) {
 			middleware, err := NewMiddleware(&Options{Emitter: capture})
 			require.NoError(t, err)
 			engine := gin.New()
-			engine.Use(gin.CustomRecovery(func(ginContext *gin.Context, _ any) {
+			engine.Use(gin.CustomRecoveryWithWriter(io.Discard, func(ginContext *gin.Context, _ any) {
 				ginContext.AbortWithStatus(http.StatusInternalServerError)
 			}), middleware)
 			engine.GET("/", func(ginContext *gin.Context) {
@@ -508,4 +508,18 @@ func TestMiddlewareBoundsAClientIPFromATrustedPlatformHeader(t *testing.T) {
 	serve(t, engine, request)
 
 	require.Len(t, onlyEvent(t, capture)["request.client_ip"], maximumClientIPBytes)
+}
+
+func TestMiddlewareRecordsAPanicInASkippedPathReachedThroughHandleContext(t *testing.T) {
+	var engine *gin.Engine
+	engine, capture := newRecoveringEngine(t, Options{SkipPaths: []string{"/health"}})
+	engine.GET("/old", func(ginContext *gin.Context) {
+		ginContext.Request.URL.Path = "/health"
+		engine.HandleContext(ginContext)
+	})
+	engine.GET("/health", func(*gin.Context) { panic("inner") })
+
+	serve(t, engine, newRequest(t, http.MethodGet, "/old"))
+
+	require.Equal(t, "panic: inner", onlyEvent(t, capture)[wideevent.KeyError])
 }

@@ -126,13 +126,13 @@ func FromContext(ginContext *gin.Context) *wideevent.Event {
 }
 
 func (m *middleware) handle(ginContext *gin.Context) {
-	if _, skip := m.skipPaths[ginContext.Request.URL.Path]; skip {
-		ginContext.Next()
-		return
-	}
 	if owned, isEvent := ginContext.Request.Context().Value(ownedEventKey{}).(*wideevent.Event); isEvent {
 		ginContext.Set(ginContextKey, owned)         // engine.HandleContext cleared the key store; the outer run emits
 		defer recordAndRaisePanic(owned, ginContext) // an inner recovery may swallow it before the outer run sees it
+		ginContext.Next()
+		return
+	}
+	if _, skip := m.skipPaths[ginContext.Request.URL.Path]; skip {
 		ginContext.Next()
 		return
 	}

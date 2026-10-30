@@ -1,6 +1,7 @@
 package wideevent
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -362,20 +363,22 @@ func summarize(fields []Field) summary {
 	return result
 }
 
-// textOf formats a value for the terminal: a string as it is, an error or fmt.Stringer through its
-// method, anything else as its fmt text, unless JSON cannot encode it (a cycle, on which fmt recurses
-// forever), which becomes "!unencodable <type>".
+// textOf formats a value for the terminal: a string as it is, an error, fmt.Stringer or number through
+// fmt, anything else as its JSON, like the JSON emitter writes it. fmt would show json:"-" fields and
+// recurse forever on a cycle.
 func textOf(value any) string {
 	switch typed := value.(type) {
 	case string:
 		return typed
-	case error, fmt.Stringer, float64, float32:
+	case error, fmt.Stringer, float64, float32, int, int64, bool:
 		return fmt.Sprint(typed)
 	}
-	if _, err := marshalJSON(value); err != nil {
-		return unencodable(value)
+	encoded := encodeJSONValue(value)
+	var unquoted string
+	if json.Unmarshal(encoded, &unquoted) == nil {
+		return unquoted // a JSON string, such as a MarshalText result or the unencodable placeholder
 	}
-	return fmt.Sprint(value)
+	return string(encoded)
 }
 
 // fieldGroup holds the fields sharing the first key segment label, with that segment stripped. The

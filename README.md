@@ -138,7 +138,7 @@ func (w *Worker) handle(ctx context.Context, job *model.Job) (err error) {
 | Emitter | Output |
 |---------|--------|
 | `NewJSONEmitter(&JSONEmitterOptions{Writer: w})` | one JSON line per event with `level` (`info`, `warn` for 4xx, `error` for failures and 5xx) and `message: "wide_event"`. Durations, times, errors, NaN and infinities among the field values are converted; a value JSON cannot encode at all (a channel, a cycle) becomes `"!unencodable <type>"` instead of losing the event. Default writer: stdout. |
-| `NewDevEmitter(&DevEmitterOptions{...})` | colorized blocks for a terminal, fields grouped by their first key segment, control characters escaped. `Categories` and `MutedCategories` label or hide requests by path prefix. |
+| `NewDevEmitter(&DevEmitterOptions{...})` | colorized blocks for a terminal, fields grouped by their first key segment, maps and structs as JSON, control characters escaped. `Categories` and `MutedCategories` label or hide requests by path prefix. |
 | `MultiEmitter(a, b)` | every event to each emitter |
 | `SampledEmitter(emitter, sampler)` | only the events the sampler keeps |
 | `EmitterFunc(func(we *Event))` | your own, for example to assert on events in tests |

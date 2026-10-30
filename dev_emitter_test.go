@@ -252,3 +252,22 @@ func TestDevEmitterSurvivesACycleAndInvalidUTF8(t *testing.T) {
 	require.Contains(t, output, `raw="a\x9bb"`)
 	require.Contains(t, output, "text=µs ünïcode")
 }
+
+// hiddenCycle hides a cycle and a secret from JSON behind json:"-".
+type hiddenCycle struct {
+	Visible string         `json:"visible"`
+	Hidden  map[string]any `json:"-"`
+}
+
+func TestDevEmitterRendersCompositesAsJSON(t *testing.T) {
+	hidden := map[string]any{"secret": "hunter2"}
+	hidden["self"] = hidden
+
+	output := emitDev(t, DevEmitterOptions{}, func(we *Event) {
+		we.Set("data.value", hiddenCycle{Visible: "shown", Hidden: hidden}).Set("data.list", []string{"a", "b"})
+	})
+
+	require.Contains(t, output, `value={"visible":"shown"}`)
+	require.Contains(t, output, `list=["a","b"]`)
+	require.NotContains(t, output, "hunter2")
+}

@@ -106,10 +106,11 @@ func jsonLine(we *Event) []byte {
 }
 
 // encodeJSONValue encodes one field value, or "!unencodable <type>". The placeholder never shows the
-// value: its fmt text could reveal unexported or json:"-" fields, and recurses forever on a cycle.
+// value: its fmt text could reveal unexported or json:"-" fields, and recurses forever on a cycle. The
+// encoding is validated like the final line will be, which rejects nesting deeper than 10000 levels.
 func encodeJSONValue(value any) json.RawMessage {
 	encoded, err := marshalJSON(jsonValue(value))
-	if err != nil {
+	if err != nil || !json.Valid(encoded) {
 		encoded, _ = marshalJSON(unencodable(value)) // a string always encodes
 	}
 	return encoded

@@ -206,3 +206,15 @@ func TestJSONEmitterSurvivesAPanickingMarshaler(t *testing.T) {
 	require.Equal(t, "!unencodable wideevent.panickingMarshaler", document["broken"])
 	require.Equal(t, "yes", document["kept"])
 }
+
+func TestJSONEmitterSurvivesTooDeepNesting(t *testing.T) {
+	var deep any = "leaf"
+	for range 10001 {
+		deep = []any{deep}
+	}
+
+	document := emitJSON(t, func(we *Event) { we.Set("deep", deep).String("kept", "yes") })
+
+	require.Equal(t, "!unencodable []interface {}", document["deep"])
+	require.Equal(t, "yes", document["kept"])
+}

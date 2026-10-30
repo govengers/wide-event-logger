@@ -46,7 +46,7 @@ Event semantics:
 
 - The JSON emitter lost the whole event when a value could not be encoded (a NaN, an infinity, a channel). NaN and infinities are written as strings, other unencodable values (a cycle, a failing or panicking `MarshalJSON`) as `"!unencodable <type>"`, each field on its own. A partial write no longer glues the next event onto the fragment.
 - An `error` set with `Set` was written as `{}`; it is written as its message.
-- The dev emitter colored `outcome=failure` like a neutral value; it is red. It escapes control characters and invalid UTF-8, survives cyclic values, so a request path cannot forge log lines or send terminal escape sequences, and shows an `error` field that is not a string.
+- The dev emitter colored `outcome=failure` like a neutral value; it is red. It renders maps, slices and structs as JSON (never fmt text, which showed json:"-" fields), escapes control characters and invalid UTF-8, so a request path cannot forge log lines or send terminal escape sequences, and shows an `error` field that is not a string.
 - Methods on a nil `*Event` panicked; they do nothing, so `FromContext(ctx).String(...)` is safe outside a unit of work and on skipped paths.
 - `Err` and `UUID` panicked on a typed nil whose `Error` or `String` method dereferences its receiver.
 - Events from `Begin` could not be sampled; `SampledEmitter` works for any event. A handler that called `Emit` itself bypassed the middleware's sampler.
