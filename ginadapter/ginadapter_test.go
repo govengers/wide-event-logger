@@ -568,3 +568,7 @@ func TestPanicText(t *testing.T) {
 		})
 	}
 }
+
+func TestErrorMessagesToleratesNilEntries(t *testing.T) {
+	require.Equal(t, []string{"<nil>", "<nil>", "boom"}, errorMessages([]*gin.Error{nil, {}, {Err: errors.New("boom")}}))
+}

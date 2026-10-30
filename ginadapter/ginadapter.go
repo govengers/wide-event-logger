@@ -245,6 +245,10 @@ func panicText(recovered any) string {
 func errorMessages(ginErrors []*gin.Error) []string {
 	messages := make([]string, len(ginErrors))
 	for index, ginError := range ginErrors {
+		if ginError == nil || ginError.Err == nil {
+			messages[index] = "<nil>"
+			continue
+		}
 		messages[index] = safetext.Of(ginError.Err, ginError.Err.Error)
 	}
 	return messages
