@@ -536,3 +536,9 @@ func TestMiddlewareRecordsACompositePanicValueByType(t *testing.T) {
 
 	require.Equal(t, "panic: map[string]interface {}", onlyEvent(t, capture)[wideevent.KeyError])
 }
+
+func TestPanicText(t *testing.T) {
+	require.Equal(t, "boom", panicText(errors.New("boom")))
+	require.Equal(t, "42", panicText(42))
+	require.Equal(t, "[]string", panicText([]string{"secret"}))
+}
