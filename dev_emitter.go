@@ -363,17 +363,18 @@ func summarize(fields []Field) summary {
 	return result
 }
 
-// textOf formats a value for the terminal: a string as it is, an error, fmt.Stringer or number through
-// fmt, anything else as its JSON, like the JSON emitter writes it. fmt would show json:"-" fields and
-// recurse forever on a cycle.
+// textOf formats a value for the terminal: a string as it is, an error through its message, a number or
+// bool through fmt, anything else as its JSON, like the JSON emitter writes it (a UUID through its
+// MarshalText). fmt, or a String method promoted from an embedded field, could show json:"-" fields, and
+// fmt recurses forever on a cycle.
 func textOf(value any) string {
 	switch typed := value.(type) {
 	case string:
 		return typed
-	case error, fmt.Stringer, float64, float32, int, int64, bool:
+	case error, float64, float32, int, int64, bool:
 		return fmt.Sprint(typed)
 	}
-	encoded := encodeJSONValue(value)
+	encoded := encodeJSONValue(value, 1)
 	var unquoted string
 	if json.Unmarshal(encoded, &unquoted) == nil {
 		return unquoted // a JSON string, such as a MarshalText result or the unencodable placeholder

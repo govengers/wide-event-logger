@@ -523,3 +523,16 @@ func TestMiddlewareRecordsAPanicInASkippedPathReachedThroughHandleContext(t *tes
 
 	require.Equal(t, "panic: inner", onlyEvent(t, capture)[wideevent.KeyError])
 }
+
+func TestMiddlewareRecordsACompositePanicValueByType(t *testing.T) {
+	engine, capture := newRecoveringEngine(t, Options{})
+	engine.GET("/", func(*gin.Context) {
+		cycle := map[string]any{"secret": "hunter2"}
+		cycle["self"] = cycle
+		panic(cycle)
+	})
+
+	serve(t, engine, newRequest(t, http.MethodGet, "/"))
+
+	require.Equal(t, "panic: map[string]interface {}", onlyEvent(t, capture)[wideevent.KeyError])
+}

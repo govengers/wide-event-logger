@@ -218,3 +218,29 @@ func TestJSONEmitterSurvivesTooDeepNesting(t *testing.T) {
 	require.Equal(t, "!unencodable []interface {}", document["deep"])
 	require.Equal(t, "yes", document["kept"])
 }
+
+// cyclicPanicMarshaler panics with a map that contains itself.
+type cyclicPanicMarshaler struct{}
+
+func (cyclicPanicMarshaler) MarshalJSON() ([]byte, error) {
+	cycle := map[string]any{}
+	cycle["self"] = cycle
+	panic(cycle)
+}
+
+func TestJSONEmitterSurvivesACyclicPanicValue(t *testing.T) {
+	document := emitJSON(t, func(we *Event) { we.Set("broken", cyclicPanicMarshaler{}) })
+	require.Equal(t, "!unencodable wideevent.cyclicPanicMarshaler", document["broken"])
+}
+
+func TestJSONEmitterCountsTheKeyPathIntoTheNestingLimit(t *testing.T) {
+	var deep any = "leaf"
+	for range 9999 {
+		deep = []any{deep}
+	}
+
+	document := emitJSON(t, func(we *Event) { we.Set("fits", deep).Set("too.deep", deep) })
+
+	require.IsType(t, []any{}, document["fits"], "9999 levels plus the root object")
+	require.Equal(t, map[string]any{"deep": "!unencodable []interface {}"}, document["too"])
+}

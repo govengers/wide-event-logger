@@ -32,7 +32,7 @@ Logged fields of the Gin middleware:
 - `name` is `http.request` for every request event; a handler may set its own.
 - `response.body_size` is 0, not -1, when the handler wrote no body.
 - Client-controlled text is cut: `request.path` to 2048 bytes, `request.query` and `request.user_agent` to 512, `request.host` to 256, `request.method` to 32. Only the first 4096 bytes of the raw query are parsed.
-- A panicking `PreEnricher` or `PostEnricher` no longer loses the event; it is recorded like a handler panic. Every recorded panic adds `panic.stack` and status 500 when the response was not written yet, so a silent recovery (`gin.CustomRecoveryWithWriter(io.Discard, ...)`) loses nothing; `gin.Recovery` prints the raw request, cookies included.
+- A panicking `PreEnricher` or `PostEnricher` no longer loses the event; it is recorded like a handler panic. A panic value that is a map, slice, struct or pointer is recorded by its type only (fmt would show its contents, and recurses forever on a cycle). Every recorded panic adds `panic.stack` and status 500 when the response was not written yet, so a silent recovery (`gin.CustomRecoveryWithWriter(io.Discard, ...)`) loses nothing; `gin.Recovery` prints the raw request, cookies included.
 - `request.client_ip` is cut to 64 bytes (Gin returns a trusted platform header verbatim).
 - `engine.HandleContext` keeps the request's event instead of starting a second one.
 

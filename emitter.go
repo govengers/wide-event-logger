@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -93,7 +94,8 @@ func jsonLine(we *Event) []byte {
 	fields := we.Fields()
 	encoded := make([]Field, len(fields))
 	for index, field := range fields {
-		encoded[index] = Field{Key: field.Key, Value: encodeJSONValue(field.Value)}
+		enclosingObjects := strings.Count(field.Key, ".") + 1 // the line's root object and one per key segment
+		encoded[index] = Field{Key: field.Key, Value: encodeJSONValue(field.Value, enclosingObjects)}
 	}
 	document := nestFields(encoded)
 	document["level"] = levelOf(we)
@@ -107,10 +109,11 @@ func jsonLine(we *Event) []byte {
 
 // encodeJSONValue encodes one field value, or "!unencodable <type>". The placeholder never shows the
 // value: its fmt text could reveal unexported or json:"-" fields, and recurses forever on a cycle. The
-// encoding is validated like the final line will be, which rejects nesting deeper than 10000 levels.
-func encodeJSONValue(value any) json.RawMessage {
+// encoding is validated inside enclosingObjects levels, as the final line nests it, so a value too deep
+// for a JSON decoder becomes the placeholder instead of breaking the line.
+func encodeJSONValue(value any, enclosingObjects int) json.RawMessage {
 	encoded, err := marshalJSON(jsonValue(value))
-	if err != nil || !json.Valid(encoded) {
+	if err != nil || !validWhenNested(encoded, enclosingObjects) {
 		encoded, _ = marshalJSON(unencodable(value)) // a string always encodes
 	}
 	return encoded
@@ -120,7 +123,7 @@ func encodeJSONValue(value any) json.RawMessage {
 func marshalJSON(value any) (encoded []byte, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("marshal %T: panic: %v", value, recovered)
+			err = fmt.Errorf("marshal %T: panic", value) // the panic value itself may be cyclic, fmt would recurse forever
 		}
 	}()
 	var buffer bytes.Buffer
@@ -130,6 +133,15 @@ func marshalJSON(value any) (encoded []byte, err error) {
 		return nil, fmt.Errorf("marshal %T: %w", value, encodeError)
 	}
 	return bytes.TrimSuffix(buffer.Bytes(), []byte{'\n'}), nil
+}
+
+// validWhenNested reports whether a decoder accepts encoded nested in the given number of levels.
+func validWhenNested(encoded []byte, levels int) bool {
+	nested := make([]byte, 0, len(encoded)+2*levels)
+	nested = append(nested, bytes.Repeat([]byte{'['}, levels)...)
+	nested = append(nested, encoded...)
+	nested = append(nested, bytes.Repeat([]byte{']'}, levels)...)
+	return json.Valid(nested)
 }
 
 func unencodable(value any) string {

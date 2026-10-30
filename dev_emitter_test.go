@@ -271,3 +271,18 @@ func TestDevEmitterRendersCompositesAsJSON(t *testing.T) {
 	require.Contains(t, output, `list=["a","b"]`)
 	require.NotContains(t, output, "hunter2")
 }
+
+// promotedStringer hides an embedded buffer from JSON; its promoted String method would print it.
+type promotedStringer struct {
+	*bytes.Buffer `json:"-"`
+	Visible       string `json:"visible"`
+}
+
+func TestDevEmitterPrefersJSONOverAPromotedStringMethod(t *testing.T) {
+	output := emitDev(t, DevEmitterOptions{}, func(we *Event) {
+		we.Set("data.value", promotedStringer{Buffer: bytes.NewBufferString("hunter2"), Visible: "shown"})
+	})
+
+	require.Contains(t, output, `value={"visible":"shown"}`)
+	require.NotContains(t, output, "hunter2")
+}

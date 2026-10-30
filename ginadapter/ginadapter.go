@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -208,9 +209,23 @@ func recordAndRaisePanic(we *wideevent.Event, ginContext *gin.Context) {
 // recordPanic marks the event failed with the panic and its stack, and records status 500 when the
 // response is not written yet, which is what a recovery middleware sends.
 func recordPanic(we *wideevent.Event, ginContext *gin.Context, recovered any) {
-	we.Failure(fmt.Errorf("panic: %v", recovered)).String("panic.stack", truncate(string(debug.Stack()), maximumStackBytes))
+	we.Failure(fmt.Errorf("panic: %s", panicText(recovered))).String("panic.stack", truncate(string(debug.Stack()), maximumStackBytes))
 	if !ginContext.Writer.Written() {
 		we.Int(wideevent.KeyResponseStatus, http.StatusInternalServerError)
+	}
+}
+
+// panicText formats a panic value: a string, an error or a scalar as fmt prints it, a composite value as its
+// type only, since fmt recurses forever on a cyclic map and would show unexported fields.
+func panicText(recovered any) string {
+	if _, isError := recovered.(error); isError {
+		return fmt.Sprint(recovered)
+	}
+	switch reflect.ValueOf(recovered).Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct, reflect.Pointer, reflect.Interface:
+		return fmt.Sprintf("%T", recovered)
+	default:
+		return fmt.Sprint(recovered)
 	}
 }
 
