@@ -15,6 +15,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/mattn/go-isatty"
+
+	"github.com/govengers/wide-event-logger/internal/safetext"
 )
 
 // ANSI escape codes for terminal colors.
@@ -371,7 +373,9 @@ func textOf(value any) string {
 	switch typed := value.(type) {
 	case string:
 		return typed
-	case error, float64, float32, int, int64, bool:
+	case error:
+		return safetext.Of(typed, typed.Error)
+	case float64, float32, int, int64, bool:
 		return fmt.Sprint(typed)
 	}
 	encoded := encodeJSONValue(value, 1)

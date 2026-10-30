@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/govengers/wide-event-logger/internal/safetext"
 )
 
 // Keys of the fields this package reads itself: HasError, StatusCode and the emitters interpret them.
@@ -138,20 +140,22 @@ func (we *Event) Time(key string, value time.Time) *Event {
 	return we.Set(key, value)
 }
 
-// Err records the message of err. A nil err records nothing.
+// Err records the message of err. A nil err records nothing; an Error method that panics, such as on a nil
+// receiver, records "!panicked <type>".
 func (we *Event) Err(key string, err error) *Event {
 	if we == nil || err == nil {
 		return we
 	}
-	return we.Set(key, fmt.Sprint(err)) // fmt survives an Error method that panics on a nil receiver
+	return we.Set(key, safetext.Of(err, err.Error))
 }
 
-// UUID records the text of value, typically a UUID. A nil value records nothing.
+// UUID records the text of value, typically a UUID. A nil value records nothing; a String method that
+// panics records "!panicked <type>".
 func (we *Event) UUID(key string, value fmt.Stringer) *Event {
 	if we == nil || value == nil {
 		return we
 	}
-	return we.Set(key, fmt.Sprint(value))
+	return we.Set(key, safetext.Of(value, value.String))
 }
 
 // Success sets the outcome to "success".

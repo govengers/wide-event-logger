@@ -48,7 +48,7 @@ Event semantics:
 - An `error` set with `Set` was written as `{}`; it is written as its message.
 - The dev emitter colored `outcome=failure` like a neutral value; it is red. It renders maps, slices and structs as JSON (never fmt text, which showed json:"-" fields), escapes control characters and invalid UTF-8, so a request path cannot forge log lines or send terminal escape sequences, and shows an `error` field that is not a string.
 - Methods on a nil `*Event` panicked; they do nothing, so `FromContext(ctx).String(...)` is safe outside a unit of work and on skipped paths.
-- `Err` and `UUID` panicked on a typed nil whose `Error` or `String` method dereferences its receiver.
+- `Err` and `UUID` panicked on a typed nil whose `Error` or `String` method dereferences its receiver. An `Error` or `String` method that panics is recorded as `"!panicked <type>"`, here, for errors in the JSON and dev emitters and for Gin errors.
 - Events from `Begin` could not be sampled; `SampledEmitter` works for any event. A handler that called `Emit` itself bypassed the middleware's sampler.
 - The JSON and dev emitters serialize their writes, so any `io.Writer` is safe.
 

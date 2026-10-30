@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/govengers/wide-event-logger/internal/safetext"
 )
 
 // Emitter outputs finished events. Event.Emit calls it once per event; an Emitter shared between units
@@ -94,7 +96,9 @@ func jsonLine(we *Event) []byte {
 	fields := we.Fields()
 	encoded := make([]Field, len(fields))
 	for index, field := range fields {
-		enclosingObjects := strings.Count(field.Key, ".") + 1 // the line's root object and one per key segment
+		// the line's root object, one object per key segment, and one more when the key is also the prefix
+		// of other keys and its value moves under "_value"
+		enclosingObjects := strings.Count(field.Key, ".") + 2
 		encoded[index] = Field{Key: field.Key, Value: encodeJSONValue(field.Value, enclosingObjects)}
 	}
 	document := nestFields(encoded)
@@ -156,7 +160,7 @@ func jsonValue(value any) any {
 	case time.Time:
 		return typed.Format(time.RFC3339Nano)
 	case error:
-		return fmt.Sprint(typed)
+		return safetext.Of(typed, typed.Error)
 	case float64:
 		return finiteFloat(typed)
 	case float32:

@@ -17,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	wideevent "github.com/govengers/wide-event-logger"
+	"github.com/govengers/wide-event-logger/internal/safetext"
 )
 
 // RequestIDHeader is read for request.id and set on every response.
@@ -218,8 +219,8 @@ func recordPanic(we *wideevent.Event, ginContext *gin.Context, recovered any) {
 // panicText formats a panic value: a string, an error or a scalar as fmt prints it, a composite value as its
 // type only, since fmt recurses forever on a cyclic map and would show unexported fields.
 func panicText(recovered any) string {
-	if _, isError := recovered.(error); isError {
-		return fmt.Sprint(recovered)
+	if recoveredError, isError := recovered.(error); isError {
+		return safetext.Of(recoveredError, recoveredError.Error)
 	}
 	switch reflect.ValueOf(recovered).Kind() {
 	case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct, reflect.Pointer, reflect.Interface:
@@ -229,11 +230,11 @@ func panicText(recovered any) string {
 	}
 }
 
-// errorMessages formats each error with fmt, which survives an Error method that panics on a typed nil.
+// errorMessages formats each error; an Error method that panics, such as on a typed nil, gives "!panicked <type>".
 func errorMessages(ginErrors []*gin.Error) []string {
 	messages := make([]string, len(ginErrors))
 	for index, ginError := range ginErrors {
-		messages[index] = fmt.Sprint(ginError.Err)
+		messages[index] = safetext.Of(ginError.Err, ginError.Err.Error)
 	}
 	return messages
 }

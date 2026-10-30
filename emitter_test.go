@@ -235,12 +235,23 @@ func TestJSONEmitterSurvivesACyclicPanicValue(t *testing.T) {
 
 func TestJSONEmitterCountsTheKeyPathIntoTheNestingLimit(t *testing.T) {
 	var deep any = "leaf"
-	for range 9999 {
+	for range 9998 {
 		deep = []any{deep}
 	}
 
 	document := emitJSON(t, func(we *Event) { we.Set("fits", deep).Set("too.deep", deep) })
 
-	require.IsType(t, []any{}, document["fits"], "9999 levels plus the root object")
+	require.IsType(t, []any{}, document["fits"], "9998 levels, the root object and a reserved _value level")
 	require.Equal(t, map[string]any{"deep": "!unencodable []interface {}"}, document["too"])
+}
+
+func TestJSONEmitterCountsAConflictLevelIntoTheNestingLimit(t *testing.T) {
+	var deep any = "leaf"
+	for range 9999 {
+		deep = []any{deep}
+	}
+
+	document := emitJSON(t, func(we *Event) { we.Set("a", deep).Int("a.b", 1) })
+
+	require.Equal(t, map[string]any{"_value": "!unencodable []interface {}", "b": float64(1)}, document["a"])
 }

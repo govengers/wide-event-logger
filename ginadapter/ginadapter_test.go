@@ -432,7 +432,7 @@ func TestMiddlewareSurvivesATypedNilGinError(t *testing.T) {
 
 	serve(t, engine, newRequest(t, http.MethodGet, "/"))
 
-	require.Equal(t, []string{"<nil>"}, onlyEvent(t, capture)["response.gin_errors"])
+	require.Equal(t, []string{"!panicked *ginadapter.nilReceiverError"}, onlyEvent(t, capture)["response.gin_errors"])
 }
 
 func TestMiddlewareKeepsOneEventAcrossHandleContext(t *testing.T) {
