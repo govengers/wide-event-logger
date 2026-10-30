@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/mattn/go-isatty"
 )
@@ -361,10 +362,18 @@ func summarize(fields []Field) summary {
 	return result
 }
 
-// textOf returns a string value as it is and any other value, such as an error set with Set, as its fmt text.
+// textOf formats a value for the terminal: a string as it is, an error or fmt.Stringer through its
+// method, anything else as its fmt text, unless JSON cannot encode it (a cycle, on which fmt recurses
+// forever), which becomes "!unencodable <type>".
 func textOf(value any) string {
-	if typed, isString := value.(string); isString {
+	switch typed := value.(type) {
+	case string:
 		return typed
+	case error, fmt.Stringer, float64, float32:
+		return fmt.Sprint(typed)
+	}
+	if _, err := marshalJSON(value); err != nil {
+		return unencodable(value)
 	}
 	return fmt.Sprint(value)
 }
@@ -448,7 +457,7 @@ func devFormatValue(value any) string {
 		}
 		return printable(typed)
 	default:
-		return printable(fmt.Sprint(value))
+		return printable(textOf(value))
 	}
 }
 
@@ -463,11 +472,15 @@ func devFormatDuration(duration time.Duration) string {
 	}
 }
 
-// printable quotes text that contains control characters, escaping them, and returns any other text as
-// it is.
+// printable quotes text that contains control or other nonprinting characters or invalid UTF-8, escaping
+// them, and returns any other text as it is. A raw byte like 0x9b is a control sequence on some terminals.
 func printable(text string) string {
-	if strings.ContainsFunc(text, unicode.IsControl) {
+	if !utf8.ValidString(text) || strings.ContainsFunc(text, isNotPrintable) {
 		return strconv.Quote(text)
 	}
 	return text
+}
+
+func isNotPrintable(character rune) bool {
+	return !unicode.IsPrint(character)
 }

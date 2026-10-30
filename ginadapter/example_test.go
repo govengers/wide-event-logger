@@ -2,6 +2,7 @@ package ginadapter_test
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -28,7 +29,14 @@ func ExampleNewMiddleware() {
 	}
 
 	engine := gin.New()
-	engine.Use(gin.Recovery(), middleware)
+	if err := engine.SetTrustedProxies(nil); err != nil { // request.client_ip trusts no X-Forwarded-For
+		fmt.Println(err)
+		return
+	}
+	// The event holds the panic and its stack; a silent recovery keeps the raw request out of the logs.
+	engine.Use(gin.CustomRecoveryWithWriter(io.Discard, func(ginContext *gin.Context, _ any) {
+		ginContext.AbortWithStatus(http.StatusInternalServerError)
+	}), middleware)
 	engine.GET("/api/users/:id", func(ginContext *gin.Context) {
 		we := ginadapter.FromContext(ginContext)
 		we.String("user.lookup_id", ginContext.Param("id")).Success()

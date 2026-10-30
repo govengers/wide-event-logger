@@ -140,7 +140,7 @@ func (we *Event) Time(key string, value time.Time) *Event {
 
 // Err records the message of err. A nil err records nothing.
 func (we *Event) Err(key string, err error) *Event {
-	if err == nil {
+	if we == nil || err == nil {
 		return we
 	}
 	return we.Set(key, fmt.Sprint(err)) // fmt survives an Error method that panics on a nil receiver
@@ -148,7 +148,7 @@ func (we *Event) Err(key string, err error) *Event {
 
 // UUID records the text of value, typically a UUID. A nil value records nothing.
 func (we *Event) UUID(key string, value fmt.Stringer) *Event {
-	if value == nil {
+	if we == nil || value == nil {
 		return we
 	}
 	return we.Set(key, fmt.Sprint(value))

@@ -203,3 +203,22 @@ func TestContextRoundTrip(t *testing.T) {
 	we := Begin(nil, "job")
 	require.Same(t, we, FromContext(NewContext(t.Context(), we)))
 }
+
+// countingError counts calls of String and Error.
+type countingError struct{ calls *int }
+
+func (stringer countingError) String() string {
+	*stringer.calls++
+	return "id"
+}
+
+func (stringer countingError) Error() string { return stringer.String() }
+
+func TestNilEventCallsNoValueMethods(t *testing.T) {
+	calls := 0
+	var we *Event
+
+	we.UUID("id", countingError{&calls}).UserID(countingError{&calls}).Err("error", countingError{&calls})
+
+	require.Zero(t, calls)
+}

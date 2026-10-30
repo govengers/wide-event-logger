@@ -163,26 +163,28 @@ func TestJSONEmitterReservesLevelAndMessage(t *testing.T) {
 	require.Equal(t, "info", document["level"])
 }
 
-// shortWriter accepts only the first limit bytes of its first write and fails it.
-type shortWriter struct {
+// failingWriter writes the given number of bytes of its first writes and fails them; later writes succeed.
+type failingWriter struct {
 	bytes.Buffer
-	limit  int
-	failed bool
+	acceptedBytes []int
 }
 
-func (writer *shortWriter) Write(data []byte) (int, error) {
-	if !writer.failed && len(data) > writer.limit {
-		writer.failed = true
-		written, _ := writer.Buffer.Write(data[:writer.limit])
-		return written, errors.New("disk full")
+func (writer *failingWriter) Write(data []byte) (int, error) {
+	if len(writer.acceptedBytes) == 0 {
+		return writer.Buffer.Write(data)
 	}
-	return writer.Buffer.Write(data)
+	accepted := min(writer.acceptedBytes[0], len(data))
+	writer.acceptedBytes = writer.acceptedBytes[1:]
+	written, _ := writer.Buffer.Write(data[:accepted])
+	return written, errors.New("disk full")
 }
 
 func TestJSONEmitterEndsAFragmentAfterAPartialWrite(t *testing.T) {
-	writer := &shortWriter{limit: 10}
+	// a partial write, then a write that fails completely, then success
+	writer := &failingWriter{acceptedBytes: []int{10, 0}}
 	emitter := NewJSONEmitter(&JSONEmitterOptions{Writer: writer})
 
+	Begin(emitter, "partial").Emit()
 	Begin(emitter, "lost").Emit()
 	Begin(emitter, "kept").Emit()
 
@@ -190,4 +192,17 @@ func TestJSONEmitterEndsAFragmentAfterAPartialWrite(t *testing.T) {
 	require.Len(t, lines, 2)
 	require.False(t, json.Valid([]byte(lines[0])))
 	require.True(t, json.Valid([]byte(lines[1])), "the next event is a whole line")
+	require.Contains(t, lines[1], `"kept"`)
+}
+
+// panickingMarshaler panics in MarshalJSON.
+type panickingMarshaler struct{}
+
+func (panickingMarshaler) MarshalJSON() ([]byte, error) { panic("broken marshaler") }
+
+func TestJSONEmitterSurvivesAPanickingMarshaler(t *testing.T) {
+	document := emitJSON(t, func(we *Event) { we.Set("broken", panickingMarshaler{}).String("kept", "yes") })
+
+	require.Equal(t, "!unencodable wideevent.panickingMarshaler", document["broken"])
+	require.Equal(t, "yes", document["kept"])
 }

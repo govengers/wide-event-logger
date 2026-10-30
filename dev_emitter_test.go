@@ -239,3 +239,16 @@ func TestDevEmitterShowsANonStringError(t *testing.T) {
 	output := emitDev(t, DevEmitterOptions{}, func(we *Event) { we.Set(KeyError, errors.New("boom")) })
 	require.Contains(t, output, "error=boom")
 }
+
+func TestDevEmitterSurvivesACycleAndInvalidUTF8(t *testing.T) {
+	cycle := map[string]any{}
+	cycle["self"] = cycle
+
+	output := emitDev(t, DevEmitterOptions{}, func(we *Event) {
+		we.Set("data.cycle", cycle).String("data.raw", "a\x9bb").String("data.text", "µs ünïcode")
+	})
+
+	require.Contains(t, output, "cycle=!unencodable map[string]interface {}")
+	require.Contains(t, output, `raw="a\x9bb"`)
+	require.Contains(t, output, "text=µs ünïcode")
+}

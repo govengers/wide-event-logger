@@ -32,7 +32,8 @@ Logged fields of the Gin middleware:
 - `name` is `http.request` for every request event; a handler may set its own.
 - `response.body_size` is 0, not -1, when the handler wrote no body.
 - Client-controlled text is cut: `request.path` to 2048 bytes, `request.query` and `request.user_agent` to 512, `request.host` to 256, `request.method` to 32. Only the first 4096 bytes of the raw query are parsed.
-- A panicking `PreEnricher` or `PostEnricher` no longer loses the event; it is recorded like a handler panic.
+- A panicking `PreEnricher` or `PostEnricher` no longer loses the event; it is recorded like a handler panic. Every recorded panic adds `panic.stack` and status 500 when the response was not written yet, so a silent recovery (`gin.CustomRecoveryWithWriter(io.Discard, ...)`) loses nothing; `gin.Recovery` prints the raw request, cookies included.
+- `request.client_ip` is cut to 64 bytes (Gin returns a trusted platform header verbatim).
 - `engine.HandleContext` keeps the request's event instead of starting a second one.
 
 Event semantics:
@@ -43,9 +44,9 @@ Event semantics:
 
 ### Fixed
 
-- The JSON emitter lost the whole event when a value could not be encoded (a NaN, an infinity, a channel). NaN and infinities are written as strings, other unencodable values as `"!unencodable <type>"`. A partial write no longer glues the next event onto the fragment.
+- The JSON emitter lost the whole event when a value could not be encoded (a NaN, an infinity, a channel). NaN and infinities are written as strings, other unencodable values (a cycle, a failing or panicking `MarshalJSON`) as `"!unencodable <type>"`, each field on its own. A partial write no longer glues the next event onto the fragment.
 - An `error` set with `Set` was written as `{}`; it is written as its message.
-- The dev emitter colored `outcome=failure` like a neutral value; it is red. It escapes control characters, so a request path cannot forge log lines or send terminal escape sequences, and shows an `error` field that is not a string.
+- The dev emitter colored `outcome=failure` like a neutral value; it is red. It escapes control characters and invalid UTF-8, survives cyclic values, so a request path cannot forge log lines or send terminal escape sequences, and shows an `error` field that is not a string.
 - Methods on a nil `*Event` panicked; they do nothing, so `FromContext(ctx).String(...)` is safe outside a unit of work and on skipped paths.
 - `Err` and `UUID` panicked on a typed nil whose `Error` or `String` method dereferences its receiver.
 - Events from `Begin` could not be sampled; `SampledEmitter` works for any event. A handler that called `Emit` itself bypassed the middleware's sampler.

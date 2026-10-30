@@ -54,12 +54,16 @@ func main() {
         log.Fatal(err)
     }
 
-    gin.SetMode(gin.ReleaseMode) // in debug mode gin.Recovery prints the raw request, cookies included
     engine := gin.New()
-    if err := engine.SetTrustedProxies(nil); err != nil { // or your proxies' addresses; request.client_ip trusts X-Forwarded-For only from them
+    // or your proxies' addresses: request.client_ip trusts X-Forwarded-For only from them
+    if err := engine.SetTrustedProxies(nil); err != nil {
         log.Fatal(err)
     }
-    engine.Use(gin.Recovery(), middleware)
+    // The event records a panic and its stack; gin.Recovery would also print the raw request, cookies included.
+    recovery := gin.CustomRecoveryWithWriter(io.Discard, func(ginContext *gin.Context, _ any) {
+        ginContext.AbortWithStatus(http.StatusInternalServerError)
+    })
+    engine.Use(recovery, middleware)
     engine.PUT("/api/v1/products/:id", func(ginContext *gin.Context) {
         we := ginadapter.FromContext(ginContext)
         we.String("name", "update_product")
@@ -74,7 +78,7 @@ func main() {
 }
 ```
 
-The middleware records `request.method`, `path`, `query`, `host`, `proto`, `content_length`, `client_ip`, `user_agent`, `id`, `start_time`, then `response.status`, `body_size`, `gin_errors` (when there are any) and the event's `duration`. It emits when the handler returns, and also when the handler or an enricher panics: the event gets `outcome=failure`, `error="panic: ..."` and status 500, and the panic is raised again for `gin.Recovery`. Handlers do not call `Emit` on the request event; the middleware does. Gin's automatic trailing-slash redirects run no middleware and produce no event.
+The middleware records `request.method`, `path`, `query`, `host`, `proto`, `content_length`, `client_ip`, `user_agent`, `id`, `start_time`, then `response.status`, `body_size`, `gin_errors` (when there are any) and the event's `duration`. It emits when the handler returns, and also when the handler or an enricher panics: the event gets `outcome=failure`, `error="panic: ..."` and status 500, `panic.stack` holds the stack, and the panic is raised again for the recovery middleware. Handlers do not call `Emit` on the request event; the middleware does. Gin's automatic trailing-slash redirects run no middleware and produce no event.
 
 - **Query redaction:** every query value is recorded as `redacted` unless its parameter is in `QueryAllowlist`, so OAuth codes, tokens and personal data in URLs stay out of the logs.
 - **Bounded size:** client-controlled text is cut (path 2048 bytes, query and user agent 512, host 256), so a request cannot inflate its event.

@@ -411,6 +411,8 @@ func TestMiddlewareEmitsWhenAnEnricherPanics(t *testing.T) {
 			values := onlyEvent(t, capture)
 			require.Equal(t, wideevent.OutcomeFailure, values[wideevent.KeyOutcome])
 			require.Equal(t, testCase.error, values[wideevent.KeyError])
+			require.Equal(t, http.StatusInternalServerError, values[wideevent.KeyResponseStatus], "what the recovery sends")
+			require.Contains(t, values["panic.stack"], "runtime/debug.Stack")
 		})
 	}
 }
@@ -477,4 +479,33 @@ func TestMiddlewareParsesOnlyTheStartOfAHugeQuery(t *testing.T) {
 	serve(t, engine, newRequest(t, http.MethodGet, target))
 
 	require.Equal(t, "a=redacted", onlyEvent(t, capture)["request.query"], "last lies beyond the parsed prefix")
+}
+
+func TestMiddlewareRecordsAPanicAnInnerRecoverySwallowsDuringHandleContext(t *testing.T) {
+	var engine *gin.Engine
+	engine, capture := newRecoveringEngine(t, Options{})
+	engine.GET("/old", func(ginContext *gin.Context) {
+		ginContext.Request.URL.Path = "/new"
+		engine.HandleContext(ginContext)
+	})
+	engine.GET("/new", func(*gin.Context) { panic("inner") })
+
+	recorder := serve(t, engine, newRequest(t, http.MethodGet, "/old"))
+
+	require.Equal(t, http.StatusInternalServerError, recorder.Code)
+	values := onlyEvent(t, capture)
+	require.Equal(t, "panic: inner", values[wideevent.KeyError])
+	require.Equal(t, http.StatusInternalServerError, values[wideevent.KeyResponseStatus])
+}
+
+func TestMiddlewareBoundsAClientIPFromATrustedPlatformHeader(t *testing.T) {
+	engine, capture := newEngine(t, Options{})
+	engine.TrustedPlatform = "X-Client-IP"
+	engine.GET("/", func(*gin.Context) {})
+	request := newRequest(t, http.MethodGet, "/")
+	request.Header.Set("X-Client-IP", strings.Repeat("1", 500))
+
+	serve(t, engine, request)
+
+	require.Len(t, onlyEvent(t, capture)["request.client_ip"], maximumClientIPBytes)
 }

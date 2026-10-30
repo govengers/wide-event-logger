@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -38,6 +39,8 @@ const (
 	maximumParsedQueryBytes = 4096 // the raw query is cut before parsing, bounding the work for huge queries
 	maximumQueryBytes       = 512
 	maximumUserAgentBytes   = 512
+	maximumClientIPBytes    = 64 // Gin returns a trusted platform header verbatim
+	maximumStackBytes       = 16384
 )
 
 // The printable ASCII range a client's request ID must stay in: no spaces, no control characters.
@@ -79,15 +82,19 @@ type ownedEventKey struct{}
 
 // NewMiddleware returns a Gin middleware that starts a wide event named "http.request" per request,
 // records the request and response, and emits the event when the handler returns. A panic in the
-// handler or an enricher is recorded as a failure with status 500 and raised again for an outer
-// gin.Recovery. It returns an error when options or its Emitter is nil.
+// handler or an enricher is recorded as a failure with status 500 and its stack as panic.stack, and
+// raised again for an outer recovery middleware. It returns an error when options or its Emitter is nil.
 //
 // Recorded fields: request.method, path, query (redacted, see Options.QueryAllowlist), host, proto,
-// content_length, client_ip, user_agent, id, start_time; response.status, body_size, gin_errors; and the
-// event's duration. Client-controlled text is cut to a few hundred bytes (path: 2048). request.id is the
-// client's X-Request-ID when it is printable ASCII of at most 128 characters, otherwise a generated one;
-// it is echoed in the X-Request-ID response header. request.client_ip follows Gin's trusted proxy
-// settings (engine.SetTrustedProxies).
+// content_length, client_ip, user_agent, id, start_time; response.status, body_size, gin_errors; on a
+// panic, panic.stack; and the event's duration. Client-controlled text is cut to a few hundred bytes
+// (path: 2048). request.id is the client's X-Request-ID when it is printable ASCII of at most 128
+// characters, otherwise a generated one; it is echoed in the X-Request-ID response header.
+// request.client_ip follows Gin's trusted proxy settings (engine.SetTrustedProxies).
+//
+// Mount it behind a recovery middleware that does not print the request, such as
+// gin.CustomRecoveryWithWriter(io.Discard, ...): the event already holds the panic and its stack, and
+// gin.Recovery prints the raw request, cookies included, in debug mode and for broken connections.
 //
 // Handlers must not call Emit on the request event: an early Emit freezes it before the response fields
 // are recorded, and the middleware's own Emit becomes a no-op. Requests Gin answers before running any
@@ -124,7 +131,8 @@ func (m *middleware) handle(ginContext *gin.Context) {
 		return
 	}
 	if owned, isEvent := ginContext.Request.Context().Value(ownedEventKey{}).(*wideevent.Event); isEvent {
-		ginContext.Set(ginContextKey, owned) // engine.HandleContext cleared the key store; the outer run emits
+		ginContext.Set(ginContextKey, owned)         // engine.HandleContext cleared the key store; the outer run emits
+		defer recordAndRaisePanic(owned, ginContext) // an inner recovery may swallow it before the outer run sees it
 		ginContext.Next()
 		return
 	}
@@ -155,7 +163,7 @@ func (m *middleware) recordRequest(we *wideevent.Event, ginContext *gin.Context)
 		String("request.host", truncate(request.Host, maximumHostBytes)).
 		String("request.proto", request.Proto).
 		Int64("request.content_length", request.ContentLength).
-		String("request.client_ip", ginContext.ClientIP()).
+		String("request.client_ip", truncate(ginContext.ClientIP(), maximumClientIPBytes)).
 		String("request.user_agent", truncate(request.UserAgent(), maximumUserAgentBytes)).
 		String("request.id", id).
 		Time("request.start_time", time.Now())
@@ -168,7 +176,7 @@ func (m *middleware) finish(we *wideevent.Event, ginContext *gin.Context) {
 	defer func() {
 		if finishPanic := recover(); finishPanic != nil && recovered == nil {
 			recovered = finishPanic
-			we.Failure(fmt.Errorf("panic: %v", finishPanic))
+			recordPanic(we, ginContext, finishPanic)
 		}
 		we.Emit()
 		if recovered != nil {
@@ -176,20 +184,33 @@ func (m *middleware) finish(we *wideevent.Event, ginContext *gin.Context) {
 		}
 	}()
 
-	status := ginContext.Writer.Status()
-	if recovered != nil {
-		we.Failure(fmt.Errorf("panic: %v", recovered))
-		if !ginContext.Writer.Written() {
-			status = http.StatusInternalServerError
-		}
-	}
 	// Gin reports -1 when the handler wrote no body.
-	we.Int(wideevent.KeyResponseStatus, status).Int("response.body_size", max(ginContext.Writer.Size(), 0))
+	we.Int(wideevent.KeyResponseStatus, ginContext.Writer.Status()).Int("response.body_size", max(ginContext.Writer.Size(), 0))
+	if recovered != nil {
+		recordPanic(we, ginContext, recovered)
+	}
 	if len(ginContext.Errors) > 0 {
 		we.Set("response.gin_errors", errorMessages(ginContext.Errors))
 	}
 	if m.postEnricher != nil {
 		m.postEnricher(we, ginContext)
+	}
+}
+
+// recordAndRaisePanic records a panic on the event and raises it again. It must be deferred directly.
+func recordAndRaisePanic(we *wideevent.Event, ginContext *gin.Context) {
+	if recovered := recover(); recovered != nil {
+		recordPanic(we, ginContext, recovered)
+		panic(recovered)
+	}
+}
+
+// recordPanic marks the event failed with the panic and its stack, and records status 500 when the
+// response is not written yet, which is what a recovery middleware sends.
+func recordPanic(we *wideevent.Event, ginContext *gin.Context, recovered any) {
+	we.Failure(fmt.Errorf("panic: %v", recovered)).String("panic.stack", truncate(string(debug.Stack()), maximumStackBytes))
+	if !ginContext.Writer.Written() {
+		we.Int(wideevent.KeyResponseStatus, http.StatusInternalServerError)
 	}
 }
 

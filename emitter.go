@@ -53,11 +53,12 @@ type JSONEmitterOptions struct {
 // warn or error) and "message" ("wide_event"), which replace fields of the same root key. Field values
 // that are durations are written in milliseconds, times in RFC 3339 with nanoseconds, errors as their
 // message, NaN and infinities as strings; values inside maps, slices and structs are encoded as they
-// are. A value JSON cannot encode at all (a channel, a cycle, a NaN inside a map) is replaced by
-// "!unencodable <type>" instead of losing the event. It is safe for concurrent use.
+// are. A value JSON cannot encode (a channel, a cycle, a NaN inside a map, a MarshalJSON that fails or
+// panics) is replaced by "!unencodable <type>" instead of losing the event. It is safe for concurrent use.
 type JSONEmitter struct {
-	mutex  sync.Mutex
-	writer io.Writer
+	mutex   sync.Mutex
+	writer  io.Writer
+	midLine bool // a failed write left a fragment without its newline
 }
 
 // NewJSONEmitter returns a JSONEmitter. A nil options writes to os.Stdout.
@@ -73,43 +74,65 @@ func NewJSONEmitter(options *JSONEmitterOptions) *JSONEmitter {
 }
 
 // Emit writes we as one JSON line. A failed write loses this event only; there is nowhere to report it.
+// A fragment a failed write left behind is ended first, so the next event starts on its own line.
 func (emitter *JSONEmitter) Emit(we *Event) {
 	line := jsonLine(we)
 	emitter.mutex.Lock()
 	defer emitter.mutex.Unlock()
-	written, err := emitter.writer.Write(line)
-	if err != nil && written > 0 && written < len(line) {
-		_, _ = emitter.writer.Write([]byte{'\n'}) // end the fragment, so the next event starts on its own line
+	if emitter.midLine {
+		line = append([]byte{'\n'}, line...)
+	}
+	written, _ := emitter.writer.Write(line)
+	if written > 0 {
+		emitter.midLine = written < len(line)
 	}
 }
 
+// jsonLine encodes every field value on its own, so one value JSON cannot encode costs that value only.
 func jsonLine(we *Event) []byte {
 	fields := we.Fields()
-	line, err := encodeJSONLine(we, fields, jsonValue)
-	if err != nil {
-		// A value json cannot encode: replace those values. This pass cannot fail, every value in it was
-		// marshaled on its own or is a string.
-		line, _ = encodeJSONLine(we, fields, encodableJSONValue)
-	}
-	return line
-}
-
-func encodeJSONLine(we *Event, fields []Field, convert func(any) any) ([]byte, error) {
-	converted := make([]Field, len(fields))
+	encoded := make([]Field, len(fields))
 	for index, field := range fields {
-		converted[index] = Field{Key: field.Key, Value: convert(field.Value)}
+		encoded[index] = Field{Key: field.Key, Value: encodeJSONValue(field.Value)}
 	}
-	document := nestFields(converted)
+	document := nestFields(encoded)
 	document["level"] = levelOf(we)
 	document["message"] = defaultEventMessage
+	line, err := marshalJSON(document)
+	if err != nil {
+		return nil // unreachable: the document holds only strings and values marshalJSON encoded already
+	}
+	return append(line, '\n')
+}
 
+// encodeJSONValue encodes one field value, or "!unencodable <type>". The placeholder never shows the
+// value: its fmt text could reveal unexported or json:"-" fields, and recurses forever on a cycle.
+func encodeJSONValue(value any) json.RawMessage {
+	encoded, err := marshalJSON(jsonValue(value))
+	if err != nil {
+		encoded, _ = marshalJSON(unencodable(value)) // a string always encodes
+	}
+	return encoded
+}
+
+// marshalJSON encodes value without escaping HTML. A panicking MarshalJSON or MarshalText is an error.
+func marshalJSON(value any) (encoded []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("marshal %T: panic: %v", value, recovered)
+		}
+	}()
 	var buffer bytes.Buffer
 	encoder := json.NewEncoder(&buffer)
 	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(document); err != nil {
-		return nil, fmt.Errorf("encode wide event: %w", err)
+	if encodeError := encoder.Encode(value); encodeError != nil {
+		return nil, fmt.Errorf("marshal %T: %w", value, encodeError)
 	}
-	return buffer.Bytes(), nil
+	return bytes.TrimSuffix(buffer.Bytes(), []byte{'\n'}), nil
+}
+
+func unencodable(value any) string {
+	return fmt.Sprintf("!unencodable %T", value)
 }
 
 // jsonValue converts the types JSON has no good representation for.
@@ -136,16 +159,6 @@ func finiteFloat(value float64) any {
 		return fmt.Sprint(value)
 	}
 	return value
-}
-
-// encodableJSONValue is jsonValue, replacing a value json cannot encode with its type. Its fmt text could
-// show unexported or json:"-" fields, and recurses forever on a cycle.
-func encodableJSONValue(value any) any {
-	converted := jsonValue(value)
-	if _, err := json.Marshal(converted); err != nil {
-		return fmt.Sprintf("!unencodable %T", value)
-	}
-	return converted
 }
 
 // Log levels the emitters derive from an event.
