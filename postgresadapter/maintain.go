@@ -70,9 +70,15 @@ func (s *Store) maintain(ctx context.Context, maintenance *Maintenance) error {
 	if s.retentionDays == 0 {
 		return createError
 	}
-	dropped, dropError := s.dropExpired(ctx, today.Add(-time.Duration(s.retentionDays)*day))
+	dropped, dropError := s.dropExpired(ctx, s.retentionCutoff())
 	maintenance.Dropped = dropped
 	return errors.Join(createError, dropError)
+}
+
+// retentionCutoff is the first day the retention keeps; AddDate cannot overflow like a Duration
+// of many days would.
+func (s *Store) retentionCutoff() time.Time {
+	return s.today().AddDate(0, 0, -s.retentionDays)
 }
 
 // lockMaintenance waits for Maintain's advisory lock on a connection of its own and returns the

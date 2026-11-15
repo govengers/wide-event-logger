@@ -182,15 +182,19 @@ func (e *Emitter) Flush(ctx context.Context) error {
 
 // Close stops accepting events, writes the queued ones and stops the writer. When ctx ends first
 // it aborts the writes, waits for the writer and returns ctx's error; the events not written are
-// reported as failed batches. Later calls return nil at once.
+// reported as failed batches. Later calls wait for the first one, bounded by their own ctx.
 func (e *Emitter) Close(ctx context.Context) error {
 	e.mutex.Lock()
 	alreadyClosed := e.closed
 	e.closed = true
 	e.mutex.Unlock()
 	if alreadyClosed {
-		<-e.done
-		return nil
+		select {
+		case <-e.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	close(e.stop)
 	select {
