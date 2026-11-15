@@ -83,7 +83,11 @@ that batch.
 Replicas run `Maintain` at startup and on a schedule, possibly at once. A session advisory lock on a
 connection of its own, keyed by `0x77656c67 << 32 | oid of the table` (so schemas of one database do
 not block each other), serializes them: the second waits until the first is done, then finds nothing
-to do, and each day is archived once. Waiting is bounded by the caller's context. A connection whose
+to do, and each day is archived once. Waiting is bounded by the caller's context. Everything a
+`Maintain` does (listing, creating, streaming the archive, dropping) runs on the connection that
+holds the lock: taking a second connection while holding one deadlocked as soon as the waiting
+`Maintain` calls of one process held the rest of the pool (found in CI, where the pool has four
+connections). A connection whose
 lock state is uncertain after an error (a cancelled wait, a failed unlock) is closed, which releases
 the lock with the session. A `SHARE UPDATE EXCLUSIVE` table lock would serialize as well, but a
 replica's ACCESS EXCLUSIVE request queued behind it during a long archive would stall every writer.

@@ -271,7 +271,7 @@ func (e *Emitter) retry(ctx context.Context, batch []row, first error) error {
 	if errors.Is(first, errMissingPartition) {
 		ensureContext, cancel := context.WithTimeout(ctx, e.writeTimeout)
 		defer cancel()
-		if _, err := e.store.ensurePartitions(ensureContext, batchDays(batch)); err != nil {
+		if _, err := ensurePartitions(ensureContext, e.store.pool, batchDays(batch)); err != nil {
 			return errors.Join(first, err)
 		}
 	}

@@ -87,7 +87,7 @@ type partitionTable struct {
 	schema string
 }
 
-func (s *Store) resolveTable(ctx context.Context, querier pgxQuerier) (partitionTable, error) {
+func resolveTable(ctx context.Context, querier pgxQuerier) (partitionTable, error) {
 	var schema string
 	err := querier.QueryRow(ctx, `
 SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -114,6 +114,14 @@ func partitionName(day time.Time) string {
 type pgxQuerier interface {
 	QueryRow(ctx context.Context, statement string, arguments ...any) pgx.Row
 	Query(ctx context.Context, statement string, arguments ...any) (pgx.Rows, error)
+}
+
+// database is the pool or one connection of it. Maintain runs everything on the connection that
+// holds its advisory lock: taking a second connection while holding one deadlocks when the other
+// Maintain calls of the process hold the rest of the pool.
+type database interface {
+	pgxQuerier
+	BeginTx(ctx context.Context, options pgx.TxOptions) (pgx.Tx, error)
 }
 
 // partitionDays returns the days of the table's partitions, ascending. Partitions not named by
@@ -148,8 +156,8 @@ WHERE i.inhparent = $1::text::regclass`, tableName)
 // ensurePartitions creates the partitions of days that do not exist and returns how many it
 // created. Writers and Maintain on every replica may call it at once: the ACCESS EXCLUSIVE lock on
 // the table serializes them, and the partitions are listed again under it.
-func (s *Store) ensurePartitions(ctx context.Context, days []time.Time) (int, error) {
-	existing, err := partitionDays(ctx, s.pool)
+func ensurePartitions(ctx context.Context, executor database, days []time.Time) (int, error) {
+	existing, err := partitionDays(ctx, executor)
 	if err != nil {
 		return 0, err
 	}
@@ -157,7 +165,7 @@ func (s *Store) ensurePartitions(ctx context.Context, days []time.Time) (int, er
 		return 0, nil
 	}
 	created := 0
-	err = s.underTableLock(ctx, func(transaction pgx.Tx, table partitionTable) error {
+	err = underTableLock(ctx, executor, func(transaction pgx.Tx, table partitionTable) error {
 		existing, err := partitionDays(ctx, transaction)
 		if err != nil {
 			return err
@@ -179,8 +187,8 @@ func (s *Store) ensurePartitions(ctx context.Context, days []time.Time) (int, er
 }
 
 // dropPartition drops the partition of day, if it still exists.
-func (s *Store) dropPartition(ctx context.Context, partitionDay time.Time) error {
-	return s.underTableLock(ctx, func(transaction pgx.Tx, table partitionTable) error {
+func dropPartition(ctx context.Context, executor database, partitionDay time.Time) error {
+	return underTableLock(ctx, executor, func(transaction pgx.Tx, table partitionTable) error {
 		if _, err := transaction.Exec(ctx, "DROP TABLE IF EXISTS "+table.partition(partitionDay)); err != nil {
 			return fmt.Errorf("drop the partition of %s: %v", partitionDay.Format(time.DateOnly), err) //nolint:errorlint // LIB-010
 		}
@@ -192,13 +200,13 @@ func (s *Store) dropPartition(ctx context.Context, partitionDay time.Time) error
 // on the table. The lock is taken on the table first: creating or dropping a partition locks it
 // anyway, and locking the partition first would deadlock with a reader that holds the table and
 // waits for the partition.
-func (s *Store) underTableLock(ctx context.Context, change func(transaction pgx.Tx, table partitionTable) error) error {
-	transaction, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+func underTableLock(ctx context.Context, executor database, change func(transaction pgx.Tx, table partitionTable) error) error {
+	transaction, err := executor.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return fmt.Errorf("begin the partition change: %v", err) //nolint:errorlint // LIB-010
 	}
 	defer func() { _ = transaction.Rollback(ctx) }() // after Commit a no-op; a failed rollback ends with the connection
-	table, err := s.resolveTable(ctx, transaction)
+	table, err := resolveTable(ctx, transaction)
 	if err != nil {
 		return err
 	}

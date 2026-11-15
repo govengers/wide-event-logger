@@ -55,7 +55,7 @@ func (s *Store) Maintain(ctx context.Context) error {
 }
 
 func (s *Store) maintain(ctx context.Context, maintenance *Maintenance) error {
-	unlock, err := s.lockMaintenance(ctx)
+	connection, unlock, err := s.lockMaintenance(ctx)
 	if err != nil {
 		return err
 	}
@@ -65,12 +65,12 @@ func (s *Store) maintain(ctx context.Context, maintenance *Maintenance) error {
 	for offset := range daysAhead + 1 {
 		wanted = append(wanted, today.Add(time.Duration(offset)*day))
 	}
-	created, createError := s.ensurePartitions(ctx, wanted)
+	created, createError := ensurePartitions(ctx, connection, wanted)
 	maintenance.Created = created
 	if s.retentionDays == 0 {
 		return createError
 	}
-	dropped, dropError := s.dropExpired(ctx, s.retentionCutoff())
+	dropped, dropError := s.dropExpired(ctx, connection, s.retentionCutoff())
 	maintenance.Dropped = dropped
 	return errors.Join(createError, dropError)
 }
@@ -81,20 +81,20 @@ func (s *Store) retentionCutoff() time.Time {
 	return s.today().AddDate(0, 0, -s.retentionDays)
 }
 
-// lockMaintenance waits for Maintain's advisory lock on a connection of its own and returns the
-// function that releases it. A connection whose lock state is unknown after an error is closed,
-// which releases the lock with the session.
-func (s *Store) lockMaintenance(ctx context.Context) (func(), error) {
+// lockMaintenance waits for Maintain's advisory lock on a connection of its own and returns it
+// with the function that releases the lock and the connection. A connection whose lock state is
+// unknown after an error is closed, which releases the lock with the session.
+func (s *Store) lockMaintenance(ctx context.Context) (*pgxpool.Conn, func(), error) {
 	connection, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("acquire a connection for the maintenance lock: %v", err) //nolint:errorlint // LIB-010
+		return nil, nil, fmt.Errorf("acquire a connection for the maintenance lock: %v", err) //nolint:errorlint // LIB-010
 	}
 	const key = "($1::bigint << 32) | $2::text::regclass::oid::bigint"
 	if _, err := connection.Exec(ctx, "SELECT pg_advisory_lock("+key+")", maintenanceLockSpace, tableName); err != nil {
 		discard(ctx, connection)
-		return nil, fmt.Errorf("take the maintenance lock: %v", err) //nolint:errorlint // LIB-010
+		return nil, nil, fmt.Errorf("take the maintenance lock: %v", err) //nolint:errorlint // LIB-010
 	}
-	return func() {
+	return connection, func() {
 		if _, err := connection.Exec(ctx, "SELECT pg_advisory_unlock("+key+")", maintenanceLockSpace, tableName); err != nil {
 			discard(ctx, connection)
 			return
@@ -111,8 +111,8 @@ func discard(ctx context.Context, connection *pgxpool.Conn) {
 
 // dropExpired archives and drops the partitions of the days before cutoff, oldest first, and
 // returns how many it dropped.
-func (s *Store) dropExpired(ctx context.Context, cutoff time.Time) (int, error) {
-	days, err := partitionDays(ctx, s.pool)
+func (s *Store) dropExpired(ctx context.Context, connection *pgxpool.Conn, cutoff time.Time) (int, error) {
+	days, err := partitionDays(ctx, connection)
 	if err != nil {
 		return 0, err
 	}
@@ -123,12 +123,12 @@ func (s *Store) dropExpired(ctx context.Context, cutoff time.Time) (int, error) 
 			break
 		}
 		if s.archiver != nil {
-			if err := s.archiveDay(ctx, partitionDay); err != nil {
+			if err := s.archiveDay(ctx, connection, partitionDay); err != nil {
 				errs = append(errs, fmt.Errorf("archive %s: %w", partitionDay.Format(time.DateOnly), err))
 				continue
 			}
 		}
-		if err := s.dropPartition(ctx, partitionDay); err != nil {
+		if err := dropPartition(ctx, connection, partitionDay); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -137,8 +137,9 @@ func (s *Store) dropExpired(ctx context.Context, cutoff time.Time) (int, error) 
 	return dropped, errors.Join(errs...)
 }
 
-// archiveDay streams the day's partition to the Archiver and reports the attempt.
-func (s *Store) archiveDay(ctx context.Context, archivedDay time.Time) error {
+// archiveDay streams the day's partition from connection to the Archiver and reports the attempt.
+// The connection is free again when it returns.
+func (s *Store) archiveDay(ctx context.Context, connection *pgxpool.Conn, archivedDay time.Time) error {
 	start := time.Now()
 	reader, writer := io.Pipe()
 	type streamResult struct {
@@ -155,7 +156,7 @@ func (s *Store) archiveDay(ctx context.Context, archivedDay time.Time) error {
 			_ = writer.CloseWithError(result.err) // nil ends the stream with io.EOF
 			streamed <- result
 		}()
-		result.events, result.err = s.streamDay(ctx, archivedDay, writer)
+		result.events, result.err = streamDay(ctx, connection, archivedDay, writer)
 	}()
 	archiveError := s.callArchiver(ctx, archivedDay, reader)
 	_ = reader.CloseWithError(errArchiverReturned) // unblocks the stream when the Archiver stopped reading
@@ -180,12 +181,12 @@ func (s *Store) callArchiver(ctx context.Context, archivedDay time.Time, events 
 
 // streamDay writes the day's events to out as gzip-compressed NDJSON and returns how many it
 // wrote. Rows stream from the database as out consumes them.
-func (s *Store) streamDay(ctx context.Context, streamedDay time.Time, out io.Writer) (int, error) {
-	table, err := s.resolveTable(ctx, s.pool)
+func streamDay(ctx context.Context, connection *pgxpool.Conn, streamedDay time.Time, out io.Writer) (int, error) {
+	table, err := resolveTable(ctx, connection)
 	if err != nil {
 		return 0, err
 	}
-	rows, err := s.pool.Query(ctx, "SELECT event::text FROM "+table.partition(streamedDay)+" ORDER BY time, id")
+	rows, err := connection.Query(ctx, "SELECT event::text FROM "+table.partition(streamedDay)+" ORDER BY time, id")
 	if err != nil {
 		return 0, fmt.Errorf("read the day: %v", err) //nolint:errorlint // LIB-010
 	}

@@ -165,8 +165,9 @@ func TestMaintainSurvivesAPanickingArchiver(t *testing.T) {
 	require.Contains(t, fixture.partitions(t), partitionOf(testDay))
 }
 
-// Replicas maintain at once while a writer keeps writing, on a pool whose transactions default to
-// REPEATABLE READ: every day is archived exactly once, and neither Maintain nor a write fails.
+// Replicas maintain at once while a writer keeps writing, on a small pool whose transactions
+// default to REPEATABLE READ: every day is archived exactly once, and neither Maintain nor a write
+// fails or waits for a connection the others hold.
 func TestConcurrentMaintainArchivesEachDayOnce(t *testing.T) {
 	archived := newArchive()
 	fixture := newFixture(t, &postgresadapter.Options{RetentionDays: 1, Archiver: archived})
@@ -216,6 +217,7 @@ func repeatableReadPool(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
 	t.Helper()
 	configuration := pool.Config().Copy()
 	configuration.ConnConfig.RuntimeParams["default_transaction_isolation"] = "repeatable read"
+	configuration.MaxConns = 2 // fewer than the replicas: Maintain must not wait for a second connection
 	repeatable, err := pgxpool.NewWithConfig(t.Context(), configuration)
 	require.NoError(t, err)
 	t.Cleanup(repeatable.Close)
