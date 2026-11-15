@@ -8,7 +8,8 @@ import (
 	"github.com/govengers/wide-event-logger/internal/safetext"
 )
 
-// Keys of the fields this package reads itself: HasError, StatusCode and the emitters interpret them.
+// Keys of the fields this package and its adapters read or write themselves: HasError, StatusCode and
+// the emitters interpret them, and postgresadapter stores them in their own columns.
 const (
 	KeyName           = "name"
 	KeyOutcome        = "outcome"
@@ -17,6 +18,9 @@ const (
 	KeyRequestMethod  = "request.method"
 	KeyRequestPath    = "request.path"
 	KeyResponseStatus = "response.status"
+	KeyRequestID      = "request.id" // set by the Gin middleware
+	KeyUserID         = "user.id"    // set by UserID
+	KeyTraceID        = "trace.id"   // set by govengers/telemetry's tracing
 )
 
 // Values of the outcome field, set by Success and Failure.
@@ -170,7 +174,7 @@ func (we *Event) Failure(err error) *Event {
 
 // UserID records user.id from the text of id, typically a UUID.
 func (we *Event) UserID(id fmt.Stringer) *Event {
-	return we.UUID("user.id", id)
+	return we.UUID(KeyUserID, id)
 }
 
 // UserName records user.name.

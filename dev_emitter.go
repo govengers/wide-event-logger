@@ -149,7 +149,7 @@ func (emitter *DevEmitter) Emit(we *Event) {
 	}
 
 	var builder strings.Builder
-	emitter.writeHeader(&builder, levelOf(we), eventSummary, category)
+	emitter.writeHeader(&builder, we.Level(), eventSummary, category)
 	if groups := groupFields(fields); len(groups) > 0 {
 		emitter.writeDim(&builder, gutter)
 		builder.WriteByte('\n')
@@ -438,7 +438,7 @@ type footerPart struct {
 }
 
 var (
-	levelColors   = map[string]string{levelError: ansiRed, levelWarning: ansiYellow, levelInfo: ansiGreen}
+	levelColors   = map[string]string{LevelError: ansiRed, LevelWarning: ansiYellow, LevelInfo: ansiGreen}
 	outcomeColors = map[string]string{OutcomeSuccess: ansiGreen, OutcomeFailure: ansiRed}
 )
 

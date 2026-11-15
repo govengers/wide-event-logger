@@ -168,7 +168,7 @@ func (m *middleware) recordRequest(we *wideevent.Event, ginContext *gin.Context)
 		Int64("request.content_length", request.ContentLength).
 		String("request.client_ip", truncate(ginContext.ClientIP(), maximumClientIPBytes)).
 		String("request.user_agent", truncate(request.UserAgent(), maximumUserAgentBytes)).
-		String("request.id", id).
+		String(wideevent.KeyRequestID, id).
 		Time("request.start_time", time.Now())
 }
 
