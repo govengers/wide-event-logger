@@ -22,8 +22,9 @@ a version conflict that the root requirement causes.
 
 ### W2 The core exports what an emitter outside it needs
 
-`Event.Level()` (with `LevelInfo`, `LevelWarning`, `LevelError`) and `Event.MarshalJSON()` are the
-level and the line the JSON emitter writes. The table stores that line (jsonb reorders the keys),
+`Event.Level()` (with `LevelInfo`, `LevelWarning`, `LevelError`) and `Event.JSON()` are the
+level and the line the JSON emitter writes (not `MarshalJSON`: an event reachable from its own
+fields would recurse until the stack overflows). The table stores that line (jsonb reorders the keys),
 so an archived day is the NDJSON a log collector reads from stdout. `KeyRequestID`, `KeyUserID` and `KeyTraceID`
 (`request.id`, `user.id`, `trace.id`, as ginadapter, `UserID` and govengers/telemetry write them)
 name the fields that get their own columns. All additions are backwards compatible.

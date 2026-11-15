@@ -34,7 +34,7 @@ type row struct {
 
 // newRow builds the row of we from its fields and level.
 func newRow(we *wideevent.Event, values map[string]any, level string, emitted time.Time) row {
-	encoded, _ := we.MarshalJSON() // never fails
+	encoded := we.JSON()
 	name, _ := values[wideevent.KeyName].(string)
 	eventRow := row{
 		time:      emitted,

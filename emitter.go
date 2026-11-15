@@ -91,14 +91,15 @@ func (emitter *JSONEmitter) Emit(we *Event) {
 	}
 }
 
-// MarshalJSON returns the line the JSONEmitter writes for we, without the newline: always valid JSON,
-// whatever the field values are. A nil event is null.
-func (we *Event) MarshalJSON() ([]byte, error) {
+// JSON returns the line the JSONEmitter writes for we, without the newline: always valid JSON,
+// whatever the field values are. A nil event is null. It is not MarshalJSON on purpose: an event
+// reachable from its own fields would then recurse until the stack overflows.
+func (we *Event) JSON() []byte {
 	if we == nil {
-		return []byte("null"), nil
+		return []byte("null")
 	}
 	line := jsonLine(we)
-	return line[:len(line)-1], nil
+	return line[:len(line)-1]
 }
 
 // jsonLine encodes every field value on its own, so one value JSON cannot encode costs that value only.

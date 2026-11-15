@@ -125,7 +125,7 @@ func (w *Worker) handle(ctx context.Context, job *model.Job) (err error) {
 | `Success()`, `Failure(err)` | `outcome` (and `error`) |
 | `UserID`, `UserName`, `UserRole` | `user.id`, `user.name`, `user.role` |
 | `Emit()` | sets `duration` and hands the event to the emitter, once |
-| `Level()`, `MarshalJSON()` | the level and the JSON line the JSON emitter writes, for your own emitters |
+| `Level()`, `JSON()` | the level and the JSON line the JSON emitter writes, for your own emitters |
 
 - Name the variable `we`: `we.Success()`, `we.Failure(err)`.
 - Setting a key again replaces its value. Fields keep the order in which their keys were first set.
