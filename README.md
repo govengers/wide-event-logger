@@ -32,7 +32,7 @@ Every layer adds what it did to the same event, and the event is emitted once at
 go get github.com/govengers/wide-event-logger
 ```
 
-The core package `wideevent` has no web framework dependency. The Gin middleware is in the subpackage `github.com/govengers/wide-event-logger/ginadapter`.
+The core package `wideevent` has no web framework dependency. The Gin middleware is in the subpackage `github.com/govengers/wide-event-logger/ginadapter`, the PostgreSQL store in `github.com/govengers/wide-event-logger/postgresadapter`.
 
 ## Usage
 
@@ -125,6 +125,7 @@ func (w *Worker) handle(ctx context.Context, job *model.Job) (err error) {
 | `Success()`, `Failure(err)` | `outcome` (and `error`) |
 | `UserID`, `UserName`, `UserRole` | `user.id`, `user.name`, `user.role` |
 | `Emit()` | sets `duration` and hands the event to the emitter, once |
+| `Level()`, `MarshalJSON()` | the level and the JSON line the JSON emitter writes, for your own emitters |
 
 - Name the variable `we`: `we.Success()`, `we.Failure(err)`.
 - Setting a key again replaces its value. Fields keep the order in which their keys were first set.
@@ -142,6 +143,7 @@ func (w *Worker) handle(ctx context.Context, job *model.Job) (err error) {
 | `MultiEmitter(a, b)` | every event to each emitter |
 | `SampledEmitter(emitter, sampler)` | only the events the sampler keeps |
 | `EmitterFunc(func(we *Event))` | your own, for example to assert on events in tests |
+| `postgresadapter.NewEmitter(&postgresadapter.EmitterOptions{...})` | batched rows in PostgreSQL, see [PostgreSQL](#postgresql) |
 
 Use the dev emitter locally and JSON in deployed environments.
 
@@ -168,11 +170,44 @@ emitter := wideevent.SampledEmitter(
 
 A failure handled locally (a fallback, recorded with `Err` only) is not an error for `AlwaysOnError`; mark it with a field such as `degraded=true` and keep it with a `SamplerFunc`.
 
+## PostgreSQL
+
+`postgresadapter` stores events in PostgreSQL 18 for a log viewer, an archive and retention:
+
+```go
+import (
+    wideevent "github.com/govengers/wide-event-logger"
+    "github.com/govengers/wide-event-logger/postgresadapter"
+)
+
+store, err := postgresadapter.New(&postgresadapter.Options{
+    Pool:          pool,     // *pgxpool.Pool; its search_path reaches the table
+    RetentionDays: 30,       // 0 keeps every day
+    Archiver:      archiver, // optional: receives each expired day as gzip NDJSON before it is dropped
+})
+emitter, err := postgresadapter.NewEmitter(&postgresadapter.EmitterOptions{Store: store})
+defer emitter.Close(shutdownContext) // writes what is queued
+
+middleware, err := ginadapter.NewMiddleware(&ginadapter.Options{
+    Emitter: wideevent.MultiEmitter(wideevent.NewJSONEmitter(nil), emitter),
+})
+```
+
+- **Schema:** apply `postgresadapter.MigrationV1` from one of your goose migrations; nothing runs DDL at startup. One partition per UTC day; columns `time`, `name`, `level`, `outcome`, `status`, `duration_ms`, `user_id`, `request_id`, `trace_id`, and `event` (jsonb) with the whole event as the JSON emitter writes it.
+- **Emit never blocks:** the event is encoded and queued (`QueueSize`, default 10000), one goroutine writes batches with COPY (`BatchSize` 500, `FlushInterval` 1 s). A full queue drops the event and reports it. A failed write is retried once; a missing day partition is created on demand. `Levels` and `Outcomes` keep only the chosen events.
+- **Maintain:** call `store.Maintain(ctx)` at startup and once a day (a `govengers/jobs` schedule). It creates today and three days ahead and drops the days older than the retention, each only after the `Archiver` stored it; a failed archive keeps the day. Replicas may run it at once.
+- **Query:** `store.Query(ctx, &postgresadapter.Filter{...})` filters by time range, name, level, outcome, status range, user, request and trace ID and free text, newest first, paged with `Page.Next`, at most 1000 events per page.
+- **Metrics:** `postgresadapter/prometheusadapter` implements the `Observer`: queued, written, dropped by reason, flush duration, partitions, archives.
+
+Design decisions: [docs/design.md](docs/design.md).
+
 ## Development
 
 ```bash
 just check   # lint, unit tests with coverage gate, e2e tests, govulncheck
 ```
+
+The `postgresadapter` tests start one embedded PostgreSQL 18 per test binary (downloaded once into `~/.embedded-postgres-go`) and give every test its own schema.
 
 ## Changes
 
