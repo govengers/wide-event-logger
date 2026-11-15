@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -18,8 +20,9 @@ const maintenanceLockSpace = 0x77656c67
 // Archiver stores the events of a day before its partition is dropped, usually in object storage.
 type Archiver interface {
 	// Archive reads events to its end and stores them durably; day is midnight UTC of the archived
-	// day. events is gzip-compressed NDJSON: one event per line, as the JSON emitter writes it (key
-	// order aside), oldest first. Return nil only when the day is stored: its partition is dropped
+	// day. events is gzip-compressed NDJSON: one event per line, oldest first, as the JSON emitter
+	// writes it (key order aside) plus the root key "time", the emit time in RFC 3339 UTC with
+	// microseconds, which replaces a field of that key. Return nil only when the day is stored: its partition is dropped
 	// next. Returning nil before the end of the stream counts as a failure. A day may be archived
 	// again when dropping its partition failed after the archive, so store it under a key derived
 	// from day and overwrite.
@@ -48,7 +51,9 @@ var errArchiverReturned = errors.New("the Archiver returned before the end of th
 func (s *Store) Maintain(ctx context.Context) error {
 	start := time.Now()
 	maintenance := &Maintenance{}
-	maintenance.Err = s.maintain(ctx, maintenance)
+	if err := s.maintain(ctx, maintenance); err != nil {
+		maintenance.Err = fmt.Errorf("postgresadapter: maintain: %w", err)
+	}
 	maintenance.Duration = time.Since(start)
 	s.observer.Maintained(maintenance)
 	return maintenance.Err
@@ -87,12 +92,12 @@ func (s *Store) retentionCutoff() time.Time {
 func (s *Store) lockMaintenance(ctx context.Context) (*pgxpool.Conn, func(), error) {
 	connection, err := s.pool.Acquire(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("acquire a connection for the maintenance lock: %v", err) //nolint:errorlint // LIB-010
+		return nil, nil, databaseError(ctx, "acquire a connection for the maintenance lock", err)
 	}
 	const key = "($1::bigint << 32) | $2::text::regclass::oid::bigint"
 	if _, err := connection.Exec(ctx, "SELECT pg_advisory_lock("+key+")", maintenanceLockSpace, tableName); err != nil {
 		discard(ctx, connection)
-		return nil, nil, fmt.Errorf("take the maintenance lock: %v", err) //nolint:errorlint // LIB-010
+		return nil, nil, databaseError(ctx, "take the maintenance lock", err)
 	}
 	return connection, func() {
 		if _, err := connection.Exec(ctx, "SELECT pg_advisory_unlock("+key+")", maintenanceLockSpace, tableName); err != nil {
@@ -120,6 +125,10 @@ func (s *Store) dropExpired(ctx context.Context, connection *pgxpool.Conn, cutof
 	var errs []error
 	for _, partitionDay := range days {
 		if !partitionDay.Before(cutoff) {
+			break
+		}
+		if ctx.Err() != nil {
+			errs = append(errs, ctx.Err()) // the days left wait for the next run
 			break
 		}
 		if s.archiver != nil {
@@ -179,19 +188,53 @@ func (s *Store) callArchiver(ctx context.Context, archivedDay time.Time, events 
 	return s.archiver.Archive(ctx, archivedDay, events)
 }
 
+// archiveFetchSize is how many events streamDay reads from its cursor at a time.
+const archiveFetchSize = 1000
+
 // streamDay writes the day's events to out as gzip-compressed NDJSON and returns how many it
-// wrote. Rows stream from the database as out consumes them.
+// wrote. It reads through a cursor as out consumes the events, so an Archiver that stops early
+// costs no more than the events it read.
 func streamDay(ctx context.Context, connection *pgxpool.Conn, streamedDay time.Time, out io.Writer) (int, error) {
-	table, err := resolveTable(ctx, connection)
+	transaction, err := connection.Begin(ctx)
+	if err != nil {
+		return 0, databaseError(ctx, "begin reading the day", err)
+	}
+	defer func() { _ = transaction.Rollback(ctx) }() // closes the cursor; a failed rollback ends with the connection
+	table, err := resolveTable(ctx, transaction)
 	if err != nil {
 		return 0, err
 	}
-	rows, err := connection.Query(ctx, "SELECT event::text FROM "+table.partition(streamedDay)+" ORDER BY time, id")
+	_, err = transaction.Exec(ctx, `DECLARE archived_day NO SCROLL CURSOR FOR
+SELECT (event || jsonb_build_object('time', to_char(time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')))::text
+FROM `+table.partition(streamedDay)+" ORDER BY time, id")
 	if err != nil {
-		return 0, fmt.Errorf("read the day: %v", err) //nolint:errorlint // LIB-010
+		return 0, databaseError(ctx, "read the day", err)
+	}
+	compressor := gzip.NewWriter(out)
+	events := 0
+	for {
+		fetched, err := streamEvents(ctx, transaction, compressor)
+		events += fetched
+		if err != nil {
+			return events, err
+		}
+		if fetched < archiveFetchSize {
+			break
+		}
+	}
+	if err := compressor.Close(); err != nil {
+		return events, fmt.Errorf("stream the day: %w", err)
+	}
+	return events, nil
+}
+
+// streamEvents writes the next events of streamDay's cursor to compressor and returns how many.
+func streamEvents(ctx context.Context, transaction pgx.Tx, compressor io.Writer) (int, error) {
+	rows, err := transaction.Query(ctx, "FETCH "+strconv.Itoa(archiveFetchSize)+" FROM archived_day")
+	if err != nil {
+		return 0, databaseError(ctx, "read the day", err)
 	}
 	defer rows.Close()
-	compressor := gzip.NewWriter(out)
 	events := 0
 	for rows.Next() {
 		// the raw value is pgx's read buffer: write it as it is, never append to it
@@ -204,10 +247,7 @@ func streamDay(ctx context.Context, connection *pgxpool.Conn, streamedDay time.T
 		events++
 	}
 	if err := rows.Err(); err != nil {
-		return events, fmt.Errorf("read the day: %v", err) //nolint:errorlint // LIB-010
-	}
-	if err := compressor.Close(); err != nil {
-		return events, fmt.Errorf("stream the day: %w", err)
+		return events, databaseError(ctx, "read the day", err)
 	}
 	return events, nil
 }

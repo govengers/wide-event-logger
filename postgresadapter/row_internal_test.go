@@ -8,15 +8,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestWithoutNullEscapesReplacesOnlyRealEscapes(t *testing.T) {
+func TestStorableJSONReplacesWhatJSONBRefuses(t *testing.T) {
 	for input, expected := range map[string]string{
-		`{"a":"x"}`:             `{"a":"x"}`,
-		`{"a":"\u0000"}`:        `{"a":"�"}`,
-		`{"a":"\\u0000"}`:       `{"a":"\\u0000"}`, // a backslash, then the text u0000
-		`{"a":"\\\u0000"}`:      `{"a":"\\�"}`,
-		`{"\u0000":"\"\u0000"}`: `{"�":"\"�"}`,
+		`{"a":"x"}`:                  `{"a":"x"}`,
+		`{"a":"\u0000"}`:             `{"a":"�"}`,
+		`{"a":"\\u0000"}`:            `{"a":"\\u0000"}`, // a backslash, then the text u0000
+		`{"a":"\\\u0000"}`:           `{"a":"\\�"}`,
+		`{"\u0000":"\"\u0000"}`:      `{"�":"\"�"}`,
+		`{"a":"\ud800"}`:             `{"a":"�"}`,
+		`{"a":"\uDC00x"}`:            `{"a":"�x"}`,
+		`{"a":"\ud800\u0041"}`:       `{"a":"�\u0041"}`,
+		`{"a":"\ud83d\ude00\u00e9"}`: `{"a":"\ud83d\ude00\u00e9"}`, // a valid pair and a plain escape stay
+		"{\"a\":\"\xff\"}":           `{"a":"�"}`,
 	} {
-		output := withoutNullEscapes([]byte(input))
+		output := storableJSON([]byte(input))
 		require.Equal(t, expected, string(output), input)
 		require.True(t, json.Valid(output))
 	}

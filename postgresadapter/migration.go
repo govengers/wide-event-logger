@@ -20,7 +20,8 @@ SET LOCAL statement_timeout = '30s';
 
 CREATE TABLE govengers_wide_events (
     time        timestamptz NOT NULL,
-    id          bigint GENERATED ALWAYS AS IDENTITY,
+    -- random, assigned by the emitter: with time it identifies an event across a retried write
+    id          bigint NOT NULL,
     name        text NOT NULL,
     level       text NOT NULL,
     outcome     text,

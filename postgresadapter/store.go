@@ -93,7 +93,7 @@ func resolveTable(ctx context.Context, querier pgxQuerier) (partitionTable, erro
 SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE c.oid = $1::text::regclass`, tableName).Scan(&schema)
 	if err != nil {
-		return partitionTable{}, fmt.Errorf("find the %s table: %v", tableName, err) //nolint:errorlint // LIB-010: pgx errors are not part of the API
+		return partitionTable{}, databaseError(ctx, fmt.Sprintf("find the %s table", tableName), err)
 	}
 	return partitionTable{schema: schema}, nil
 }
@@ -131,11 +131,11 @@ func partitionDays(ctx context.Context, querier pgxQuerier) ([]time.Time, error)
 SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
 WHERE i.inhparent = $1::text::regclass`, tableName)
 	if err != nil {
-		return nil, fmt.Errorf("list the partitions: %v", err) //nolint:errorlint // LIB-010
+		return nil, databaseError(ctx, "list the partitions", err)
 	}
 	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	if err != nil {
-		return nil, fmt.Errorf("list the partitions: %v", err) //nolint:errorlint // LIB-010
+		return nil, databaseError(ctx, "list the partitions", err)
 	}
 	days := make([]time.Time, 0, len(names))
 	for _, name := range names {
@@ -174,7 +174,7 @@ func ensurePartitions(ctx context.Context, executor database, days []time.Time) 
 			statement := fmt.Sprintf("CREATE TABLE %s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')",
 				table.partition(missing), table.parent(), timestampLiteral(missing), timestampLiteral(missing.Add(day)))
 			if _, err := transaction.Exec(ctx, statement); err != nil {
-				return fmt.Errorf("create the partition of %s: %v", missing.Format(time.DateOnly), err) //nolint:errorlint // LIB-010
+				return databaseError(ctx, fmt.Sprintf("create the partition of %s", missing.Format(time.DateOnly)), err)
 			}
 			created++
 		}
@@ -190,7 +190,7 @@ func ensurePartitions(ctx context.Context, executor database, days []time.Time) 
 func dropPartition(ctx context.Context, executor database, partitionDay time.Time) error {
 	return underTableLock(ctx, executor, func(transaction pgx.Tx, table partitionTable) error {
 		if _, err := transaction.Exec(ctx, "DROP TABLE IF EXISTS "+table.partition(partitionDay)); err != nil {
-			return fmt.Errorf("drop the partition of %s: %v", partitionDay.Format(time.DateOnly), err) //nolint:errorlint // LIB-010
+			return databaseError(ctx, fmt.Sprintf("drop the partition of %s", partitionDay.Format(time.DateOnly)), err)
 		}
 		return nil
 	})
@@ -203,7 +203,7 @@ func dropPartition(ctx context.Context, executor database, partitionDay time.Tim
 func underTableLock(ctx context.Context, executor database, change func(transaction pgx.Tx, table partitionTable) error) error {
 	transaction, err := executor.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return fmt.Errorf("begin the partition change: %v", err) //nolint:errorlint // LIB-010
+		return databaseError(ctx, "begin the partition change", err)
 	}
 	defer func() { _ = transaction.Rollback(ctx) }() // after Commit a no-op; a failed rollback ends with the connection
 	table, err := resolveTable(ctx, transaction)
@@ -211,18 +211,28 @@ func underTableLock(ctx context.Context, executor database, change func(transact
 		return err
 	}
 	if _, err := transaction.Exec(ctx, "SET LOCAL lock_timeout = '"+partitionLockTimeout+"'"); err != nil {
-		return fmt.Errorf("set the lock timeout: %v", err) //nolint:errorlint // LIB-010
+		return databaseError(ctx, "set the lock timeout", err)
 	}
 	if _, err := transaction.Exec(ctx, "LOCK TABLE "+table.parent()+" IN ACCESS EXCLUSIVE MODE"); err != nil {
-		return fmt.Errorf("lock the %s table: %v", tableName, err) //nolint:errorlint // LIB-010
+		return databaseError(ctx, fmt.Sprintf("lock the %s table", tableName), err)
 	}
 	if err := change(transaction, table); err != nil {
 		return err
 	}
 	if err := transaction.Commit(ctx); err != nil {
-		return fmt.Errorf("commit the partition change: %v", err) //nolint:errorlint // LIB-010
+		return databaseError(ctx, "commit the partition change", err)
 	}
 	return nil
+}
+
+// databaseError adds action to the error of a database call. The end of ctx keeps its identity, so
+// a caller tells a shutdown or a disconnected client from a failing database; a pgx error is
+// flattened (LIB-010: pgx errors are not part of the API).
+func databaseError(ctx context.Context, action string, err error) error {
+	if ctxError := ctx.Err(); ctxError != nil {
+		return fmt.Errorf("%s: %w", action, ctxError)
+	}
+	return fmt.Errorf("%s: %v", action, err) //nolint:errorlint // LIB-010
 }
 
 // missingDays returns the days of wanted that existing, sorted ascending, lacks.

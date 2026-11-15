@@ -39,7 +39,10 @@ type Filter struct {
 	MinimumStatus int // inclusive; zero means no bound. Events without a status never match a bound
 	MaximumStatus int // inclusive; zero means no bound
 
-	Text string // case-insensitive substring of the event's JSON
+	// Text is a case-insensitive substring of the event's JSON text. Quotes and backslashes in it
+	// match the characters inside a key or string value as they read, so a JSON fragment with its
+	// own quotes, such as "name":"job", does not match.
+	Text string
 
 	Limit  int    // events per page; zero means DefaultLimit, more than MaximumLimit means MaximumLimit
 	Cursor string // Page.Next of the previous page; empty starts at the newest event
@@ -92,11 +95,11 @@ func (s *Store) Query(ctx context.Context, filter *Filter) (*Page, error) {
 	statement += fmt.Sprintf("\nORDER BY time DESC, id DESC LIMIT $%d", len(arguments))
 	rows, err := s.pool.Query(ctx, statement, arguments...)
 	if err != nil {
-		return nil, fmt.Errorf("postgresadapter: query events: %v", err) //nolint:errorlint // LIB-010
+		return nil, databaseError(ctx, "postgresadapter: query events", err)
 	}
 	records, err := pgx.CollectRows(rows, scanRecord)
 	if err != nil {
-		return nil, fmt.Errorf("postgresadapter: query events: %v", err) //nolint:errorlint // LIB-010
+		return nil, databaseError(ctx, "postgresadapter: query events", err)
 	}
 	page := &Page{Records: records}
 	if len(records) > limit {
@@ -144,7 +147,7 @@ func filterConditions(filter *Filter) ([]string, []any, error) {
 		add("status <= $%d", filter.MaximumStatus)
 	}
 	if filter.Text != "" {
-		add(`event::text ILIKE $%d ESCAPE '\'`, "%"+escapeLike(filter.Text)+"%")
+		add(`event::text ILIKE $%d ESCAPE '\'`, "%"+escapeLike(jsonEscaped(storableText(filter.Text)))+"%")
 	}
 	if filter.Cursor != "" {
 		cursorTime, cursorID, err := decodeCursor(filter.Cursor)
@@ -154,6 +157,35 @@ func filterConditions(filter *Filter) ([]string, []any, error) {
 		add("(time, id) < ($%d, $%d)", cursorTime, cursorID)
 	}
 	return conditions, arguments, nil
+}
+
+// jsonEscaped escapes text as PostgreSQL writes a jsonb string, so it matches inside event::text.
+func jsonEscaped(text string) string {
+	var escaped strings.Builder
+	for _, character := range text {
+		switch character {
+		case '"', '\\':
+			escaped.WriteByte('\\')
+			escaped.WriteRune(character)
+		case '\b':
+			escaped.WriteString(`\b`)
+		case '\f':
+			escaped.WriteString(`\f`)
+		case '\n':
+			escaped.WriteString(`\n`)
+		case '\r':
+			escaped.WriteString(`\r`)
+		case '\t':
+			escaped.WriteString(`\t`)
+		default:
+			if character < ' ' {
+				fmt.Fprintf(&escaped, `\u%04x`, character)
+			} else {
+				escaped.WriteRune(character)
+			}
+		}
+	}
+	return escaped.String()
 }
 
 func escapeLike(text string) string {

@@ -2,9 +2,12 @@ package postgresadapter
 
 import (
 	"bytes"
+	"math"
+	"math/rand/v2"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	wideevent "github.com/govengers/wide-event-logger"
@@ -15,12 +18,13 @@ import (
 const maximumColumnBytes = 256
 
 // columns are the columns the emitter writes, in the order of row.values.
-var columns = []string{"time", "name", "level", "outcome", "status", "duration_ms", "user_id", "request_id", "trace_id", "event"}
+var columns = []string{"time", "id", "name", "level", "outcome", "status", "duration_ms", "user_id", "request_id", "trace_id", "event"}
 
 // row is one event as the emitter writes it. It is built in Emit, so a value the application
 // changes after Emit cannot race with the writer.
 type row struct {
 	time       time.Time
+	id         int64 // random: with time it identifies the event, so a retried write can skip what is stored
 	name       string
 	level      string
 	outcome    any // string or nil
@@ -34,19 +38,19 @@ type row struct {
 
 // newRow builds the row of we from its fields and level.
 func newRow(we *wideevent.Event, values map[string]any, level string, emitted time.Time) row {
-	encoded := we.JSON()
 	name, _ := values[wideevent.KeyName].(string)
 	eventRow := row{
 		time:      emitted,
+		id:        rand.Int64(), //nolint:gosec // G404: an identifier, not a secret
 		name:      columnText(name),
 		level:     level,
 		outcome:   textColumn(values[wideevent.KeyOutcome]),
 		userID:    textColumn(values[wideevent.KeyUserID]),
 		requestID: textColumn(values[wideevent.KeyRequestID]),
 		traceID:   textColumn(values[wideevent.KeyTraceID]),
-		event:     withoutNullEscapes(encoded),
+		event:     storableJSON(we.JSON()),
 	}
-	if status := we.StatusCode(); status != 0 {
+	if status := we.StatusCode(); status != 0 && status >= math.MinInt32 && status <= math.MaxInt32 {
 		eventRow.status = status
 	}
 	if duration, ok := values[wideevent.KeyDuration].(time.Duration); ok {
@@ -67,7 +71,7 @@ func fieldValues(we *wideevent.Event) map[string]any {
 
 func (eventRow *row) values() []any {
 	return []any{
-		eventRow.time, eventRow.name, eventRow.level, eventRow.outcome, eventRow.status, eventRow.durationMS,
+		eventRow.time, eventRow.id, eventRow.name, eventRow.level, eventRow.outcome, eventRow.status, eventRow.durationMS,
 		eventRow.userID, eventRow.requestID, eventRow.traceID, eventRow.event,
 	}
 }
@@ -86,11 +90,10 @@ func textColumn(value any) any {
 	}
 }
 
-// columnText makes text PostgreSQL accepts in a text column and an index: valid UTF-8 without
-// NUL, at most maximumColumnBytes long.
+// columnText makes text PostgreSQL accepts in a text column and an index: storable, at most
+// maximumColumnBytes long.
 func columnText(text string) string {
-	text = strings.ToValidUTF8(text, "�")
-	text = strings.ReplaceAll(text, "\x00", "�")
+	text = storableText(text)
 	if len(text) <= maximumColumnBytes {
 		return text
 	}
@@ -101,27 +104,66 @@ func columnText(text string) string {
 	return text[:cut]
 }
 
-// withoutNullEscapes replaces the escape \u0000 in JSON strings with �: jsonb rejects it,
-// which would fail the whole batch. Outside strings valid JSON has no backslash, and inside one a
-// backslash always starts an escape, so stepping over every escape finds exactly the real ones.
-func withoutNullEscapes(encoded []byte) []byte {
-	const nullEscape = `\u0000`
-	if !bytes.Contains(encoded, []byte(nullEscape)) {
+// storableText replaces invalid UTF-8 and NUL, which PostgreSQL text refuses, with U+FFFD.
+func storableText(text string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(text, replacement), "\x00", replacement)
+}
+
+const replacement = "\uFFFD"
+
+// storableJSON makes the encoded event acceptable to jsonb. encoding/json passes a
+// json.RawMessage or a MarshalJSON result through without checking UTF-8 or escapes, so a request
+// body the application records can hold invalid UTF-8, \u0000 or a lone UTF-16 surrogate escape,
+// each of which jsonb refuses. All three become U+FFFD.
+func storableJSON(encoded []byte) []byte {
+	if !utf8.Valid(encoded) {
+		encoded = bytes.ToValidUTF8(encoded, []byte(replacement)) // invalid bytes of valid JSON sit inside strings
+	}
+	if !bytes.Contains(encoded, []byte(`\u`)) {
 		return encoded
 	}
+	return storableEscapes(encoded)
+}
+
+// storableEscapes replaces the escapes jsonb refuses. Outside strings valid JSON has no backslash,
+// and inside one a backslash always starts an escape, so stepping over every escape finds exactly
+// the real ones.
+func storableEscapes(encoded []byte) []byte {
 	result := make([]byte, 0, len(encoded))
 	for index := 0; index < len(encoded); index++ {
 		if encoded[index] != '\\' {
 			result = append(result, encoded[index])
 			continue
 		}
-		if bytes.HasPrefix(encoded[index:], []byte(nullEscape)) {
-			result = append(result, `�`...)
-			index += len(nullEscape) - 1
-			continue
+		code, isUnicode := unicodeEscape(encoded[index:])
+		switch {
+		case !isUnicode:
+			result = append(result, encoded[index:min(index+2, len(encoded))]...)
+			index++
+		case utf16.IsSurrogate(rune(code)) && code < 0xdc00 && isLowSurrogateEscape(encoded[index+6:]):
+			result = append(result, encoded[index:index+12]...) // a valid pair
+			index += 11
+		case code == 0 || utf16.IsSurrogate(rune(code)):
+			result = append(result, replacement...)
+			index += 5
+		default:
+			result = append(result, encoded[index:index+6]...)
+			index += 5
 		}
-		result = append(result, encoded[index:min(index+2, len(encoded))]...)
-		index++
 	}
 	return result
+}
+
+// unicodeEscape returns the code of the \uXXXX escape at the start of escape.
+func unicodeEscape(escape []byte) (uint64, bool) {
+	if len(escape) < 6 || escape[1] != 'u' {
+		return 0, false
+	}
+	code, err := strconv.ParseUint(string(escape[2:6]), 16, 16)
+	return code, err == nil
+}
+
+func isLowSurrogateEscape(escape []byte) bool {
+	code, isUnicode := unicodeEscape(escape)
+	return isUnicode && code >= 0xdc00 && code <= 0xdfff
 }

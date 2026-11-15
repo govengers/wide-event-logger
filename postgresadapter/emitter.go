@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +29,9 @@ var ErrClosed = errors.New("postgresadapter: emitter closed")
 // sqlstateNoPartition is check_violation, which an insert into a day without a partition raises.
 const sqlstateNoPartition = "23514"
 
+// maximumUnreportedErrors bounds the write errors the writer keeps for the next Flush.
+const maximumUnreportedErrors = 16
+
 // EmitterOptions configures an Emitter.
 type EmitterOptions struct {
 	Store         *Store        // required
@@ -48,9 +52,10 @@ type EmitterOptions struct {
 // batches. It composes with wideevent.MultiEmitter and wideevent.SampledEmitter. It is safe for
 // concurrent use.
 //
-// A write that fails is retried once, after creating the missing day partition when that was the
-// cause; a batch that fails twice is lost and reported to the Observer. A write whose
-// acknowledgement is lost may be stored twice by the retry.
+// A write that fails on the connection is retried once, skipping the events the first attempt may
+// have stored, and one that fails for a missing day partition is retried after creating it. A
+// batch PostgreSQL refuses for its data is split until only the refused events are lost. Every
+// lost batch is reported to the Observer; nothing is stored twice.
 type Emitter struct {
 	store         *Store
 	batchSize     int
@@ -161,8 +166,9 @@ func (e *Emitter) enqueue(eventRow row) (DropReason, bool) {
 	}
 }
 
-// Flush writes every event queued before the call and returns the errors of those writes. It
-// returns ErrClosed after Close, and ctx's error when ctx ends first; the write goes on then.
+// Flush writes every event queued before the call and returns the errors of the writes since the
+// previous Flush, at most 16 of them. It returns ErrClosed after Close, and ctx's error when ctx
+// ends first; the write goes on then.
 func (e *Emitter) Flush(ctx context.Context) error {
 	reply := make(chan error, 1)
 	select {
@@ -207,26 +213,34 @@ func (e *Emitter) Close(ctx context.Context) error {
 	}
 }
 
-// run is the writer goroutine. ctx ends only when Close aborts.
+// run is the writer goroutine. ctx ends only when Close aborts. The errors of the writes between
+// two Flush calls go to the second one.
 func (e *Emitter) run(ctx context.Context) {
 	defer close(e.done)
 	defer e.abort()
 	ticker := time.NewTicker(e.flushInterval)
 	defer ticker.Stop()
 	batch := make([]row, 0, e.batchSize)
+	var unreported []error
+	keep := func(err error) {
+		if err != nil && len(unreported) < maximumUnreportedErrors {
+			unreported = append(unreported, err)
+		}
+	}
 	for {
 		select {
 		case eventRow := <-e.queue:
 			batch = append(batch, eventRow)
 			if len(batch) >= e.batchSize {
-				_ = e.write(ctx, batch) // reported to the Observer
+				keep(e.write(ctx, batch))
 				batch = batch[:0]
 			}
 		case <-ticker.C:
-			_ = e.write(ctx, batch) // reported to the Observer
+			keep(e.write(ctx, batch))
 			batch = batch[:0]
 		case reply := <-e.flushes:
-			reply <- e.drain(ctx, batch)
+			reply <- errors.Join(append(unreported, e.drain(ctx, batch))...)
+			unreported = nil
 			batch = batch[:0]
 		case <-e.stop:
 			_ = e.drain(ctx, batch) // reported to the Observer
@@ -250,59 +264,129 @@ func (e *Emitter) drain(ctx context.Context, batch []row) error {
 	return errors.Join(errs...)
 }
 
-// write stores batch, retrying once, and reports the result. The caller reuses batch after it
-// returns.
-func (e *Emitter) write(ctx context.Context, batch []row) error {
+// write stores batch and reports the result; the caller reuses batch after it returns. A batch
+// refused for its data is written in halves, each reported on its own, so a refused event costs
+// only itself. A panic, also one of the Observer, is the batch's error (CON-001): the writer
+// goroutine must survive any batch.
+func (e *Emitter) write(ctx context.Context, batch []row) (err error) {
 	if len(batch) == 0 {
 		return nil
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("postgresadapter: write %d events: panic: %v", len(batch), recovered)
+		}
+	}()
 	start := time.Now()
-	err := e.attempt(ctx, batch)
-	if err != nil && ctx.Err() == nil {
-		err = e.retry(ctx, batch, err)
+	failure, err := e.attempt(ctx, batch, e.copyRows)
+	if ctx.Err() == nil && (failure == failureTransient || failure == failureMissingPartition) {
+		failure, err = e.retry(ctx, batch, failure, err)
+		if failure == failureMissingPartition {
+			failure = failureData // the partitions exist now: a CHECK constraint refused a row
+		}
+	}
+	if failure == failureData && len(batch) > 1 && ctx.Err() == nil {
+		half := len(batch) / 2
+		return errors.Join(e.write(ctx, batch[:half]), e.write(ctx, batch[half:]))
 	}
 	e.store.observer.BatchWritten(&Batch{Events: len(batch), Duration: time.Since(start), Err: err})
 	return err
 }
 
 // retry writes batch a second time, after creating the missing partitions when they made the
-// first attempt fail.
-func (e *Emitter) retry(ctx context.Context, batch []row, first error) error {
-	if errors.Is(first, errMissingPartition) {
+// first attempt fail. It skips the events the first attempt stored: a connection lost after the
+// COPY was sent leaves unknown whether it committed (RES-004).
+func (e *Emitter) retry(ctx context.Context, batch []row, first failure, firstError error) (failure, error) {
+	if first == failureMissingPartition {
 		ensureContext, cancel := context.WithTimeout(ctx, e.writeTimeout)
 		defer cancel()
 		if _, err := ensurePartitions(ensureContext, e.store.pool, batchDays(batch)); err != nil {
-			return errors.Join(first, err)
+			return failurePermanent, errors.Join(firstError, err)
 		}
 	}
-	return e.attempt(ctx, batch)
+	return e.attempt(ctx, batch, e.insertNew)
 }
 
-// errMissingPartition marks a write that failed because a day of the batch has no partition.
-var errMissingPartition = errors.New("no partition for the day")
+// failure says what a failed write attempt allows next.
+type failure int
 
-// attempt copies batch into the table once. A panic is its error (CON-001): the writer goroutine
-// must survive any batch.
-func (e *Emitter) attempt(ctx context.Context, batch []row) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("postgresadapter: write %d events: panic: %v", len(batch), recovered)
-		}
-	}()
-	ctx, cancel := context.WithTimeout(ctx, e.writeTimeout)
+const (
+	failureNone             failure = iota
+	failurePermanent                // retrying cannot help: the batch is lost
+	failureTransient                // the connection or the server failed: retry once
+	failureMissingPartition         // a day of the batch has no partition: create it, then retry
+	failureData                     // PostgreSQL refused a row: split the batch
+)
+
+// attempt writes batch once with write, bounded by WriteTimeout, and classifies its failure
+// before the pgx error is flattened (LIB-010).
+func (e *Emitter) attempt(ctx context.Context, batch []row, write func(ctx context.Context, batch []row) error) (failure, error) {
+	attemptContext, cancel := context.WithTimeout(ctx, e.writeTimeout)
 	defer cancel()
-	_, err = e.store.pool.CopyFrom(ctx, pgx.Identifier{tableName}, columns, pgx.CopyFromSlice(len(batch), func(index int) ([]any, error) {
-		return batch[index].values(), nil
-	}))
+	err := write(attemptContext, batch)
 	if err == nil {
-		return nil
+		return failureNone, nil
+	}
+	return classify(attemptContext, err), databaseError(attemptContext, fmt.Sprintf("postgresadapter: write %d events", len(batch)), err)
+}
+
+// classify decides what a failed attempt allows (RES-002). An attempt that ran out of time is not
+// retried: a slow database would get the same batch again at once.
+func classify(attemptContext context.Context, err error) failure {
+	if attemptContext.Err() != nil {
+		return failurePermanent
 	}
 	var postgresError *pgconn.PgError
-	if errors.As(err, &postgresError) && postgresError.Code == sqlstateNoPartition {
-		return fmt.Errorf("postgresadapter: write %d events: %w: %v", len(batch), errMissingPartition, err) //nolint:errorlint // LIB-010: pgx errors are not part of the API
+	if !errors.As(err, &postgresError) {
+		return failureTransient // the connection failed; the rows are values pgx always encodes
 	}
-	return fmt.Errorf("postgresadapter: write %d events: %v", len(batch), err) //nolint:errorlint // LIB-010
+	switch code := postgresError.Code; {
+	case code == sqlstateNoPartition: // also a CHECK constraint of the application; the retry tells them apart
+		return failureMissingPartition
+	case strings.HasPrefix(code, "22"), strings.HasPrefix(code, "23"), strings.HasPrefix(code, "54"):
+		return failureData // data exception, integrity violation, program limit (a value too large or deep)
+	case strings.HasPrefix(code, "08"), strings.HasPrefix(code, "57P"), strings.HasPrefix(code, "53"),
+		code == "40001", code == "40P01":
+		return failureTransient // connection, shutdown, resources, serialization, deadlock
+	default:
+		return failurePermanent // for example a missing permission
+	}
 }
+
+// copyRows copies batch into the table.
+func (e *Emitter) copyRows(ctx context.Context, batch []row) error {
+	_, err := e.store.pool.CopyFrom(ctx, pgx.Identifier{tableName}, columns, pgx.CopyFromSlice(len(batch), func(index int) ([]any, error) {
+		return batch[index].values(), nil
+	}))
+	return err
+}
+
+// insertNew inserts the events of batch that are not stored yet, by time and ID, as one statement
+// of one parameter per column, whatever the batch size.
+func (e *Emitter) insertNew(ctx context.Context, batch []row) error {
+	arrays := make([][]any, len(columns))
+	for column := range arrays {
+		arrays[column] = make([]any, len(batch))
+	}
+	for index := range batch {
+		for column, value := range batch[index].values() {
+			arrays[column][index] = value
+		}
+	}
+	arguments := make([]any, len(arrays))
+	for column := range arrays {
+		arguments[column] = arrays[column]
+	}
+	_, err := e.store.pool.Exec(ctx, insertNewStatement, arguments...)
+	return err
+}
+
+// insertNewStatement unnests one array per column, in the order of columns.
+const insertNewStatement = `
+INSERT INTO govengers_wide_events (time, id, name, level, outcome, status, duration_ms, user_id, request_id, trace_id, event)
+SELECT * FROM unnest($1::timestamptz[], $2::bigint[], $3::text[], $4::text[], $5::text[], $6::integer[],
+    $7::double precision[], $8::text[], $9::text[], $10::text[], $11::jsonb[])
+ON CONFLICT (time, id) DO NOTHING`
 
 // batchDays returns the UTC days of the batch's events.
 func batchDays(batch []row) []time.Time {
