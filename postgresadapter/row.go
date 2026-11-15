@@ -3,11 +3,9 @@ package postgresadapter
 import (
 	"bytes"
 	"math"
-	"math/rand/v2"
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf16"
 	"unicode/utf8"
 
 	wideevent "github.com/govengers/wide-event-logger"
@@ -24,7 +22,7 @@ var columns = []string{"time", "id", "name", "level", "outcome", "status", "dura
 // changes after Emit cannot race with the writer.
 type row struct {
 	time       time.Time
-	id         int64 // random: with time it identifies the event, so a retried write can skip what is stored
+	id         int64 // with time it identifies the event, so a retried write can skip what is stored
 	name       string
 	level      string
 	outcome    any // string or nil
@@ -37,11 +35,11 @@ type row struct {
 }
 
 // newRow builds the row of we from its fields and level.
-func newRow(we *wideevent.Event, values map[string]any, level string, emitted time.Time) row {
+func newRow(we *wideevent.Event, values map[string]any, level string, emitted time.Time, id int64) row {
 	name, _ := values[wideevent.KeyName].(string)
 	eventRow := row{
 		time:      emitted,
-		id:        rand.Int64(), //nolint:gosec // G404: an identifier, not a secret
+		id:        id,
 		name:      columnText(name),
 		level:     level,
 		outcome:   textColumn(values[wideevent.KeyOutcome]),
@@ -140,10 +138,10 @@ func storableEscapes(encoded []byte) []byte {
 		case !isUnicode:
 			result = append(result, encoded[index:min(index+2, len(encoded))]...)
 			index++
-		case utf16.IsSurrogate(rune(code)) && code < 0xdc00 && isLowSurrogateEscape(encoded[index+6:]):
+		case code >= 0xd800 && code <= 0xdbff && isLowSurrogateEscape(encoded[index+6:]):
 			result = append(result, encoded[index:index+12]...) // a valid pair
 			index += 11
-		case code == 0 || utf16.IsSurrogate(rune(code)):
+		case code == 0 || code >= 0xd800 && code <= 0xdfff: // NUL or a surrogate without its pair
 			result = append(result, replacement...)
 			index += 5
 		default:

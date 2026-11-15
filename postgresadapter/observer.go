@@ -13,6 +13,7 @@ type Observer interface {
 	// EventDropped reports an event Emit could not queue.
 	EventDropped(reason DropReason)
 	// BatchWritten reports one write of queued events, successful or not. A failed batch is lost.
+	// A batch the database refused for a row is split, and each part is reported on its own.
 	BatchWritten(batch *Batch)
 	// Maintained reports one Maintain call.
 	Maintained(maintenance *Maintenance)
@@ -32,7 +33,7 @@ const (
 // Batch is one write of queued events.
 type Batch struct {
 	Events   int           // events in the batch, written or, with Err, lost
-	Duration time.Duration // of both attempts when the first one failed
+	Duration time.Duration // of both attempts when the first one was retried
 	Err      error
 }
 

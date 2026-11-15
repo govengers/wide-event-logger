@@ -1,6 +1,7 @@
 package postgresadapter_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -135,4 +136,37 @@ func TestQueryRejectsABadCursorAndLimit(t *testing.T) {
 	page, err := fixture.store.Query(t.Context(), &postgresadapter.Filter{Limit: postgresadapter.MaximumLimit + 1})
 	require.NoError(t, err, "a large limit is cut, not refused")
 	require.Empty(t, page.Records)
+}
+
+func TestQueryTextMatchesQuotesBackslashesAndStoredReplacements(t *testing.T) {
+	fixture := newFixture(t, nil)
+	emitter := fixture.emitter(t, nil)
+	emitEvent(emitter, "parse", func(we *wideevent.Event) { we.Failure(errors.New(`invalid input "abc" in C:\tmp`)) })
+	emitEvent(emitter, "binary", func(we *wideevent.Event) { we.String("payload", "a\x00b\xffc") })
+	require.NoError(t, emitter.Flush(t.Context()))
+
+	for text, expected := range map[string][]string{
+		`input "abc"`: {"parse"},
+		`C:\tmp`:      {"parse"},
+		"a\x00b\xffc": {"binary"}, // stored and searched as a�b�c
+	} {
+		page, err := fixture.store.Query(t.Context(), &postgresadapter.Filter{Text: text})
+		require.NoError(t, err, text)
+		names := make([]string, 0, len(page.Records))
+		for _, record := range page.Records {
+			names = append(names, record.Name)
+		}
+		require.Equal(t, expected, names, text)
+	}
+}
+
+func TestQueryKeepsTheEndOfItsContext(t *testing.T) {
+	fixture := newFixture(t, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := fixture.store.Query(ctx, nil)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, fixture.store.Maintain(ctx), context.Canceled)
 }

@@ -42,18 +42,42 @@ asynchronous emitter is asked for by constructing it, like `sql.DB` or OpenTelem
 processor, and `Close(ctx)` is its documented owner (CON-006). The goroutine's context is local to
 it; the emitter keeps only its cancel function, which `Close` calls when its own context ends.
 
-### W4 Batches are copied with COPY and retried once
+### W4 Batches are copied with COPY; failures are classified before anything is retried
 
 The writer flushes when a batch is full (`BatchSize`, default 500) and every `FlushInterval`
 (default 1 s), and on `Flush`/`Close` drains the events queued at that moment (later ones wait for
 the next round, so a steady stream cannot keep a drain going). A batch is written with
-`pgx.CopyFrom` into the partitioned table, bounded by `WriteTimeout` (default 10 s). A failed write
-is retried once while the emitter is not aborted: a pool connection killed by a database restart
-fails the first attempt and a fresh one serves the second. When the failure is SQLSTATE 23514 (no
-partition for the day) the retry first creates the missing days (W6). A batch that fails twice is
-lost and reported in `BatchWritten`; a write whose acknowledgement was lost may be stored twice.
-Logs tolerate a duplicate better than a gap; an application that needs every event also writes
-them to stdout (`MultiEmitter`). A panic in a write is that batch's error (CON-001).
+`pgx.CopyFrom` into the partitioned table, bounded by `WriteTimeout` (default 10 s). The failure of
+an attempt decides what follows (RES-002), classified before the pgx error is flattened:
+
+| Failure | Next |
+|---|---|
+| connection error without a server reply, SQLSTATE class 08, 57P, 53, 40001, 40P01 | one retry at once: a pool connection killed by a database restart fails, a fresh one serves the retry |
+| 23514 (no partition for the day) | create the missing days (W6), then one retry; a 23514 after that is a CHECK constraint of the application, so data |
+| class 22, 23, 54 (the database refuses a value of a row) | split the batch in halves and write each, down to the single refused row |
+| the attempt's own `WriteTimeout`, the emitter aborted by `Close`, anything else (42501) | none: the batch is lost |
+
+The retry is idempotent (RES-004): every event carries an `id` the emitter assigns, and the retry
+inserts with `ON CONFLICT (time, id) DO NOTHING` (one `unnest` array per column, so any batch size
+fits one statement), so a COPY that committed although its acknowledgement was lost is not stored
+twice. IDs count up per emitter from a random start: emit order breaks ties of `time`, and two
+emitters share a `(time, id)` only within one microsecond and with overlapping number ranges, in
+which case the second row is refused alone (23505) by the split. A deadline is not retried: a slow
+database would get the same batch again at once while the queue overflows. The retry runs at once,
+without a backoff (RES-003): it is a single second attempt on another connection, and a sleeping
+writer would only fill the queue.
+
+The split replaces a list of known causes (W9 removes them at the source, but a json.RawMessage
+from a remote party, an application constraint or a jsonb limit can still refuse a row): a refused
+row costs about 2 log2(n) COPYs and only itself. Each part is reported in `BatchWritten`, so a
+lost row is its own `Batch` with `Events` 1. A batch whose every row is refused costs about 2n
+fast-failing statements; that needs a schema the emitter does not match, which the first
+`BatchWritten` error shows.
+
+`Flush` returns the errors of every write since the previous `Flush` (at most 16), not only of the
+writes it does itself: an event whose size-triggered write failed while `Flush` waited was queued
+before the call. A panic in a write, in partition creation or in the Observer's `BatchWritten` is
+that batch's error (CON-001), so the writer goroutine survives it.
 
 ### W5 One partition per UTC day, no default partition
 
@@ -66,6 +90,9 @@ There is no default partition. It would collect rows of days without a partition
 `DROP` of a day (rows of that day could sit in the default) and make creating a day's partition scan
 it. Instead `Maintain` creates today and three days ahead, and the writer creates a missing day on
 demand (W4), so neither a missed maintenance nor a fresh install loses events.
+
+The primary key is `(time, id)`, with `id` assigned by the emitter (W4) instead of an identity
+column: only a key known before the write lets a retry skip what the first attempt stored.
 
 ### W6 Creating and dropping a partition locks the table first
 
@@ -97,8 +124,14 @@ replica's ACCESS EXCLUSIVE request queued behind it during a long archive would 
 
 `RetentionDays` keeps that many full days before today; zero keeps everything. With an `Archiver`
 each expired day is streamed before its partition is dropped: one goroutine reads the partition
-(`event::text`, ordered by time and ID, rows streamed as they are consumed), writes gzip NDJSON into
-an `io.Pipe`, and the Archiver reads the other end. The day counts as archived only when the
+through a cursor in a transaction (`FETCH` 1000 at a time, ordered by time and ID), writes gzip
+NDJSON into an `io.Pipe`, and the Archiver reads the other end. An Archiver that fails early costs
+the events fetched so far, not a read of the whole day. Each line is the event plus the root key
+`time` (RFC 3339 UTC with microseconds), which replaces a field of that key as `level` and
+`message` do in the JSON emitter: the emit time is otherwise only in the `time` column, and an
+archive without it could never be repaired. A `Maintain` whose context ends starts no further
+archive; the remaining days wait for the next run. Errors keep the end of the context (`errors.Is`
+with `context.Canceled` works), so a scheduler tells a shutdown from a failing database. The day counts as archived only when the
 Archiver returned nil and the stream ended cleanly; an Archiver that returns nil before reading to
 the end fails the day, so a short upload never leads to a drop. A failed day keeps its partition,
 is reported in `DayArchived` and the joined error of `Maintain`, and the other days go on. A drop
@@ -107,10 +140,14 @@ archivers store under a key derived from the day and overwrite.
 
 ### W9 Text the database would reject is made storable
 
-One bad row fails a whole COPY, so the row is made acceptable before it is queued: text columns get
-invalid UTF-8 and NUL replaced by U+FFFD and are cut to 256 bytes on a character boundary (index
-entries stay small; the event column keeps the whole value); the JSON escape `\u0000`, which jsonb
-refuses, becomes `�`. Filter values are cut the same way, so a long user ID still matches.
+One bad row would cost a split (W4), so the row is made acceptable before it is queued: text
+columns get invalid UTF-8 and NUL replaced by U+FFFD and are cut to 256 bytes on a character
+boundary (index entries stay small; the event column keeps the whole value). encoding/json passes a
+`json.RawMessage` or a `MarshalJSON` result through without checking UTF-8 or escapes, so the
+encoded event gets invalid UTF-8, the escape `\u0000` and UTF-16 surrogate escapes without their
+pair replaced by U+FFFD; jsonb refuses all three. A status outside PostgreSQL's integer is stored
+as NULL (the event keeps it). Filter values are cleaned and cut the same way, so a long user ID
+still matches.
 
 ### W10 Query pages newest first with an opaque keyset cursor
 
@@ -118,8 +155,10 @@ refuses, becomes `�`. Filter values are cut the same way, so a long user ID st
 cursor's `(time, id)` with a row comparison, so ties within one microsecond page correctly.
 Conditions compare bare columns (indexes on name, user, request and trace ID); the free-text search
 is `event::text ILIKE` with escaped wildcards and reads every event of the time range, which is why
-callers bound it with a time range and a context deadline. `Limit` defaults to 100 and is cut to
-1000. No trigram index: it needs an extension and slows every insert; add one in the application's
+callers bound it with a time range and a context deadline. The search text is cleaned like a stored
+value and escaped as PostgreSQL writes a jsonb string, so `input "abc"` and `C:\tmp` match the
+values they appear in; a JSON fragment with its own quotes does not. `Limit` defaults to 100 and
+is cut to 1000. No trigram index: it needs an extension and slows every insert; add one in the application's
 own migration when the text search is hot.
 
 ### W11 Observer and Prometheus metrics
@@ -141,7 +180,9 @@ the library's xz decoder, which takes 30-40 s inside a `-race` test binary.
 
 ### Not done
 
-- No per-row fallback when a batch fails on data: W9 removes the known causes.
+- No per-row fallback COPY by COPY: the split of W4 finds a refused row in about 2 log2(n) writes.
+- No `id` in the archived line: it would replace an application field `id`; `time` and the order
+  identify a line within its day.
 - No queue-length gauge: queued minus written minus dropped gives the backlog.
 - No index for level or outcome filters: they are scanned within the time range.
 - No end-to-end test with PostgreSQL in `test/e2e`: the unit tests already run against a real

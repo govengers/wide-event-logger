@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -63,6 +65,9 @@ type Emitter struct {
 	writeTimeout  time.Duration
 	levels        []string
 	outcomes      []string
+	// lastID numbers the events from a random start: emit order breaks ties of time, and two
+	// emitters share a (time, id) only in one microsecond with number ranges that overlap.
+	lastID atomic.Int64
 
 	queue   chan row
 	flushes chan chan error
@@ -91,6 +96,7 @@ func NewEmitter(options *EmitterOptions) (*Emitter, error) {
 		stop:          make(chan struct{}),
 		done:          make(chan struct{}),
 	}
+	emitter.lastID.Store(rand.Int64N(1 << 62)) //nolint:gosec // G404: an identifier, not a secret
 	ctx, abort := context.WithCancel(context.Background())
 	emitter.abort = abort
 	go emitter.run(ctx)
@@ -149,7 +155,7 @@ func (e *Emitter) rowOf(we *wideevent.Event) (row, bool) {
 			return row{}, false
 		}
 	}
-	return newRow(we, values, level, e.store.now()), true
+	return newRow(we, values, level, e.store.now(), e.lastID.Add(1)), true
 }
 
 func (e *Emitter) enqueue(eventRow row) (DropReason, bool) {

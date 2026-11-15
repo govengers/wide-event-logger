@@ -285,3 +285,57 @@ FOR VALUES FROM ('2000-01-01 00:00:00+00') TO ('2001-01-01 00:00:00+00')`)
 
 	require.Contains(t, fixture.partitions(t), "govengers_wide_events_legacy")
 }
+
+func TestMaintainArchivesEachEventWithItsTime(t *testing.T) {
+	var lines []map[string]any
+	keepLines := postgresadapter.ArchiverFunc(func(_ context.Context, _ time.Time, events io.Reader) error {
+		decompressed, err := gzip.NewReader(events)
+		if err != nil {
+			return err
+		}
+		scanner := bufio.NewScanner(decompressed)
+		for scanner.Scan() {
+			var line map[string]any
+			if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
+				return err
+			}
+			lines = append(lines, line)
+		}
+		return scanner.Err()
+	})
+	fixture := newFixture(t, &postgresadapter.Options{RetentionDays: 1, Archiver: keepLines})
+	fixture.emitOn(t, testDay, "job")
+	// more events than one read of the cursor fetches
+	_, err := fixture.pool.Exec(t.Context(), `INSERT INTO govengers_wide_events (time, id, name, level, event)
+SELECT $1::timestamptz + make_interval(secs => n), n, 'bulk', 'info', '{"name":"bulk"}' FROM generate_series(1, 2500) n`, testDay.Add(13*time.Hour))
+	require.NoError(t, err)
+	fixture.clock.Set(testDay.Add(2 * day))
+
+	require.NoError(t, fixture.store.Maintain(t.Context()))
+
+	require.Len(t, lines, 2501)
+	require.Equal(t, "job", lines[0]["name"])
+	require.Equal(t, "2026-03-14T12:00:00.000000Z", lines[0]["time"])
+	require.Equal(t, "2026-03-14T13:41:40.000000Z", lines[2500]["time"], "oldest first, to the last event")
+}
+
+func TestMaintainStopsArchivingWhenItsContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	calls := 0
+	cancelling := postgresadapter.ArchiverFunc(func(context.Context, time.Time, io.Reader) error {
+		calls++
+		cancel() // the application shuts down during the first archive
+		return context.Canceled
+	})
+	fixture := newFixture(t, &postgresadapter.Options{RetentionDays: 1, Archiver: cancelling})
+	for offset := range 3 {
+		fixture.emitOn(t, testDay.Add(time.Duration(offset)*day), "event")
+	}
+	fixture.clock.Set(testDay.Add(5 * day))
+
+	err := fixture.store.Maintain(ctx)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 1, calls, "no archive starts after the context ended")
+	require.Subset(t, fixture.partitions(t), []string{partitionOf(testDay), partitionOf(testDay.Add(day)), partitionOf(testDay.Add(2 * day))}, "every day is kept")
+}

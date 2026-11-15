@@ -20,4 +20,5 @@
 - `emitter, _ := postgresadapter.NewEmitter(&postgresadapter.EmitterOptions{Store: store})`; starts one writer goroutine; `defer emitter.Close(ctx)`. Emit never blocks; a full queue drops and reports `EventDropped`. Compose with `wideevent.MultiEmitter` and `wideevent.SampledEmitter`; `Levels` and `Outcomes` filter.
 - `store.Maintain(ctx)` at startup and daily (govengers/jobs schedule): creates today plus 3 days, archives then drops days older than RetentionDays; safe on several replicas; a failed archive keeps the day.
 - `store.Query(ctx, &postgresadapter.Filter{From, To, Name, Level, Outcome, UserID, RequestID, TraceID, MinimumStatus, MaximumStatus, Text, Limit, Cursor})` returns `*Page{Records, Next}`, newest first, Limit at most 1000.
-- An Archiver gets `(ctx, day, io.Reader)` with gzip NDJSON, must read to the end, and should overwrite by day key (a day may be archived again).
+- An Archiver gets `(ctx, day, io.Reader)` with gzip NDJSON (each line the event plus a root `time`, RFC 3339 UTC), must read to the end, and should overwrite by day key (a day may be archived again).
+- Event IDs are assigned by the emitter, so the one retry after a connection failure skips what was stored; a row the database refuses costs only itself.
