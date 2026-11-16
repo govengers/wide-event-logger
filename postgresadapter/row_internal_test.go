@@ -18,6 +18,7 @@ func TestStorableJSONReplacesWhatJSONBRefuses(t *testing.T) {
 		`{"a":"\ud800"}`:             `{"a":"�"}`,
 		`{"a":"\uDC00x"}`:            `{"a":"�x"}`,
 		`{"a":"\ud800\u0041"}`:       `{"a":"�\u0041"}`,
+		`{"a":"\ud800auDC00"}`:       `{"a":"�auDC00"}`,            // text after a high surrogate is not its pair
 		`{"a":"\ud83d\ude00\u00e9"}`: `{"a":"\ud83d\ude00\u00e9"}`, // a valid pair and a plain escape stay
 		"{\"a\":\"\xff\"}":           `{"a":"�"}`,
 	} {

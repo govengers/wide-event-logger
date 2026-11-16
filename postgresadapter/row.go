@@ -154,7 +154,7 @@ func storableEscapes(encoded []byte) []byte {
 
 // unicodeEscape returns the code of the \uXXXX escape at the start of escape.
 func unicodeEscape(escape []byte) (uint64, bool) {
-	if len(escape) < 6 || escape[1] != 'u' {
+	if len(escape) < 6 || escape[0] != '\\' || escape[1] != 'u' {
 		return 0, false
 	}
 	code, err := strconv.ParseUint(string(escape[2:6]), 16, 16)
