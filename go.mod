@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/gin-gonic/gin v1.12.0
-	github.com/govengers/postgrestest v0.0.0-20261116042556-e8a91e54648c
+	github.com/govengers/postgrestest v0.1.0
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/mattn/go-isatty v0.0.24
 	github.com/prometheus/client_golang v1.25.0
