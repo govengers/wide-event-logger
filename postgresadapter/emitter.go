@@ -34,6 +34,20 @@ const sqlstateNoPartition = "23514"
 // maximumUnreportedErrors bounds the write errors the writer keeps for the next Flush.
 const maximumUnreportedErrors = 16
 
+// A write that failed on the connection or the server is attempted up to maximumAttempts times,
+// waiting from retryBaseDelay, doubling up to maximumRetryDelay, with jitter (RES-003): about 33 s
+// in all, which spans a database restart or failover while the queue buffers what arrives.
+const (
+	maximumAttempts   = 10
+	retryBaseDelay    = 100 * time.Millisecond
+	maximumRetryDelay = 10 * time.Second
+)
+
+// expiryGrace is how long before Maintain may archive and drop a day the writer stops writing
+// into it, so a write in flight or a replica clock that runs behind cannot add to a day while it
+// is archived. The longest write, every attempt and wait included, is added on top.
+const expiryGrace = time.Hour
+
 // EmitterOptions configures an Emitter.
 type EmitterOptions struct {
 	Store         *Store        // required
@@ -54,15 +68,18 @@ type EmitterOptions struct {
 // batches. It composes with wideevent.MultiEmitter and wideevent.SampledEmitter. It is safe for
 // concurrent use.
 //
-// A write that fails on the connection is retried once, skipping the events the first attempt may
-// have stored, and one that fails for a missing day partition is retried after creating it. A
-// batch PostgreSQL refuses for its data is split until only the refused events are lost. Every
-// lost batch is reported to the Observer; nothing is stored twice.
+// A write that fails on the connection or the server is retried with backoff, skipping the events
+// an earlier attempt may have stored, and one that fails for a missing day partition is retried
+// after creating it. A batch PostgreSQL refuses for its data is split until only the refused
+// events are lost. An event that waited until its day is about to leave the retention is dropped
+// (DropExpired), so a day is never written while Maintain archives it. Every lost batch is
+// reported to the Observer; nothing is stored twice.
 type Emitter struct {
 	store         *Store
 	batchSize     int
 	flushInterval time.Duration
 	writeTimeout  time.Duration
+	retryDelay    time.Duration // retryBaseDelay; tests wait less
 	levels        []string
 	outcomes      []string
 	// lastID numbers the events from a random start: emit order breaks ties of time, and two
@@ -81,6 +98,10 @@ type Emitter struct {
 
 // NewEmitter validates options and starts the writer goroutine; Close stops it. It does no I/O.
 func NewEmitter(options *EmitterOptions) (*Emitter, error) {
+	return newEmitter(options, retryBaseDelay)
+}
+
+func newEmitter(options *EmitterOptions, retryDelay time.Duration) (*Emitter, error) {
 	if err := validateEmitterOptions(options); err != nil {
 		return nil, err
 	}
@@ -89,6 +110,7 @@ func NewEmitter(options *EmitterOptions) (*Emitter, error) {
 		batchSize:     valueOr(options.BatchSize, DefaultBatchSize),
 		flushInterval: valueOr(options.FlushInterval, DefaultFlushInterval),
 		writeTimeout:  valueOr(options.WriteTimeout, DefaultWriteTimeout),
+		retryDelay:    retryDelay,
 		levels:        slices.Clone(options.Levels),
 		outcomes:      slices.Clone(options.Outcomes),
 		queue:         make(chan row, valueOr(options.QueueSize, DefaultQueueSize)),
@@ -96,7 +118,8 @@ func NewEmitter(options *EmitterOptions) (*Emitter, error) {
 		stop:          make(chan struct{}),
 		done:          make(chan struct{}),
 	}
-	emitter.lastID.Store(rand.Int64N(1 << 62)) //nolint:gosec // G404: an identifier, not a secret
+	// below 2^52, so an ID stays exact as a JSON number in JavaScript
+	emitter.lastID.Store(rand.Int64N(1 << 52)) //nolint:gosec // G404: an identifier, not a secret
 	ctx, abort := context.WithCancel(context.Background())
 	emitter.abort = abort
 	go emitter.run(ctx)
@@ -194,7 +217,8 @@ func (e *Emitter) Flush(ctx context.Context) error {
 
 // Close stops accepting events, writes the queued ones and stops the writer. When ctx ends first
 // it aborts the writes, waits for the writer and returns ctx's error; the events not written are
-// reported as failed batches. Later calls wait for the first one, bounded by their own ctx.
+// reported as failed batches. Later calls wait for the first one, bounded by their own ctx. While
+// the database is down the queued batches wait for their retries, so give ctx a deadline.
 func (e *Emitter) Close(ctx context.Context) error {
 	e.mutex.Lock()
 	alreadyClosed := e.closed
@@ -275,22 +299,18 @@ func (e *Emitter) drain(ctx context.Context, batch []row) error {
 // only itself. A panic, also one of the Observer, is the batch's error (CON-001): the writer
 // goroutine must survive any batch.
 func (e *Emitter) write(ctx context.Context, batch []row) (err error) {
-	if len(batch) == 0 {
-		return nil
-	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("postgresadapter: write %d events: panic: %v", len(batch), recovered)
 		}
 	}()
+	batch = e.withoutExpired(batch)
+	if len(batch) == 0 {
+		return nil
+	}
 	start := time.Now()
 	failure, err := e.attempt(ctx, batch, e.copyRows)
-	if ctx.Err() == nil && (failure == failureTransient || failure == failureMissingPartition) {
-		failure, err = e.retry(ctx, batch, failure, err)
-		if failure == failureMissingPartition {
-			failure = failureData // the partitions exist now: a CHECK constraint refused a row
-		}
-	}
+	failure, err = e.retry(ctx, batch, failure, err)
 	if failure == failureData && len(batch) > 1 && ctx.Err() == nil {
 		half := len(batch) / 2
 		return errors.Join(e.write(ctx, batch[:half]), e.write(ctx, batch[half:]))
@@ -299,18 +319,74 @@ func (e *Emitter) write(ctx context.Context, batch []row) (err error) {
 	return err
 }
 
-// retry writes batch a second time, after creating the missing partitions when they made the
-// first attempt fail. It skips the events the first attempt stored: a connection lost after the
-// COPY was sent leaves unknown whether it committed (RES-004).
-func (e *Emitter) retry(ctx context.Context, batch []row, first failure, firstError error) (failure, error) {
-	if first == failureMissingPartition {
-		ensureContext, cancel := context.WithTimeout(ctx, e.writeTimeout)
-		defer cancel()
-		if _, err := ensurePartitions(ensureContext, e.store.pool, batchDays(batch)); err != nil {
-			return failurePermanent, errors.Join(firstError, err)
-		}
+// withoutExpired returns batch without the events of days Maintain may archive and drop within the
+// grace of the longest write, and reports each as dropped. It returns batch itself when every
+// event is kept.
+func (e *Emitter) withoutExpired(batch []row) []row {
+	fence := e.store.retentionCutoff(e.store.now().Add(expiryGrace + maximumAttempts*(e.writeTimeout+maximumRetryDelay)))
+	if fence.IsZero() || !slices.ContainsFunc(batch, func(eventRow row) bool { return eventRow.time.Before(fence) }) {
+		return batch
 	}
-	return e.attempt(ctx, batch, e.insertNew)
+	kept := make([]row, 0, len(batch))
+	for _, eventRow := range batch {
+		if eventRow.time.Before(fence) {
+			e.store.observer.EventDropped(DropExpired)
+			continue
+		}
+		kept = append(kept, eventRow)
+	}
+	return kept
+}
+
+// retry writes batch again while the failure of the last attempt allows it: a transient one after
+// a backoff, a missing partition once, after creating it. Every retry skips the events an earlier
+// attempt stored: a connection lost after the COPY was sent leaves unknown whether it committed
+// (RES-004).
+func (e *Emitter) retry(ctx context.Context, batch []row, failure failure, err error) (failure, error) {
+	attempts, createdPartitions := 1, false
+	for ctx.Err() == nil {
+		switch failure {
+		case failureTransient:
+			if attempts >= maximumAttempts || !e.backOff(ctx, attempts) {
+				return failure, err
+			}
+		case failureMissingPartition:
+			if createdPartitions {
+				return failureData, err // the partitions exist: a CHECK constraint refused a row
+			}
+			createdPartitions = true
+			ensureContext, cancel := context.WithTimeout(ctx, e.writeTimeout)
+			_, ensureError := ensurePartitions(ensureContext, e.store.pool, batchDays(batch))
+			cancel()
+			if ensureError != nil {
+				return failurePermanent, errors.Join(err, databaseError(ctx, fmt.Sprintf("postgresadapter: write %d events", len(batch)), ensureError))
+			}
+		default:
+			return failure, err
+		}
+		attempts++
+		failure, err = e.attempt(ctx, batch, e.insertNew)
+	}
+	return failure, err
+}
+
+// backOff waits before the retry that follows attempt and reports whether ctx is still alive.
+func (e *Emitter) backOff(ctx context.Context, attempt int) bool {
+	timer := time.NewTimer(backoff(e.retryDelay, attempt))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// backoff is the wait after attempt (from 1): base doubled per attempt, capped at
+// maximumRetryDelay, plus 0-20 % jitter.
+func backoff(base time.Duration, attempt int) time.Duration {
+	delay := min(base<<min(attempt-1, 16), maximumRetryDelay) // the shift is bounded, so it never overflows
+	return delay + rand.N(delay/5+1)                          //nolint:gosec // G404: jitter, not a secret
 }
 
 // failure says what a failed write attempt allows next.
@@ -319,13 +395,14 @@ type failure int
 const (
 	failureNone             failure = iota
 	failurePermanent                // retrying cannot help: the batch is lost
-	failureTransient                // the connection or the server failed: retry once
+	failureTransient                // the connection or the server failed: retry after a backoff
 	failureMissingPartition         // a day of the batch has no partition: create it, then retry
 	failureData                     // PostgreSQL refused a row: split the batch
 )
 
 // attempt writes batch once with write, bounded by WriteTimeout, and classifies its failure
-// before the pgx error is flattened (LIB-010).
+// before the pgx error is flattened (LIB-010). Only the end of ctx keeps its identity: a write
+// that ran out of WriteTimeout is a lost batch, not the end of a caller's context.
 func (e *Emitter) attempt(ctx context.Context, batch []row, write func(ctx context.Context, batch []row) error) (failure, error) {
 	attemptContext, cancel := context.WithTimeout(ctx, e.writeTimeout)
 	defer cancel()
@@ -333,7 +410,7 @@ func (e *Emitter) attempt(ctx context.Context, batch []row, write func(ctx conte
 	if err == nil {
 		return failureNone, nil
 	}
-	return classify(attemptContext, err), databaseError(attemptContext, fmt.Sprintf("postgresadapter: write %d events", len(batch)), err)
+	return classify(attemptContext, err), databaseError(ctx, fmt.Sprintf("postgresadapter: write %d events", len(batch)), err)
 }
 
 // classify decides what a failed attempt allows (RES-002). An attempt that ran out of time is not
@@ -379,9 +456,10 @@ func (e *Emitter) insertNew(ctx context.Context, batch []row) error {
 			arrays[column][index] = value
 		}
 	}
-	arguments := make([]any, len(arrays))
+	// described, so the arrays encode whatever the pool's default exec mode
+	arguments := append(make([]any, 0, 1+len(arrays)), pgx.QueryExecModeDescribeExec)
 	for column := range arrays {
-		arguments[column] = arrays[column]
+		arguments = append(arguments, arrays[column])
 	}
 	_, err := e.store.pool.Exec(ctx, insertNewStatement, arguments...)
 	return err

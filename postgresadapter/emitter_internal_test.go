@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	wideevent "github.com/govengers/wide-event-logger"
@@ -43,35 +45,53 @@ func TestClassifyRetriesOnlyTransientFailures(t *testing.T) {
 	}
 }
 
-// The retry after a connection lost behind a committed COPY must not store the batch twice.
+// The retry after a connection lost behind a committed COPY must not store the batch twice, on a
+// pool in any exec mode.
 func TestInsertNewSkipsTheStoredEvents(t *testing.T) {
-	start0 := time.Now()
-	pool := postgrestest.New(t, MigrationV1)
-	t.Log("pool", time.Since(start0))
-	store, err := New(&Options{Pool: pool})
-	require.NoError(t, err)
-	emitter, err := NewEmitter(&EmitterOptions{Store: store, FlushInterval: time.Hour})
-	require.NoError(t, err)
-	defer func() { require.NoError(t, emitter.Close(t.Context())) }()
-	_, err = ensurePartitions(t.Context(), pool, []time.Time{store.today()})
-	require.NoError(t, err)
-	batch := make([]row, 0, 3)
-	for range cap(batch) {
-		eventRow, _ := emitter.rowOf(wideevent.Begin(nil, "event"))
-		batch = append(batch, eventRow)
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeExec, pgx.QueryExecModeSimpleProtocol} {
+		t.Run(mode.String(), func(t *testing.T) {
+			configuration := postgrestest.New(t, MigrationV1).Config()
+			configuration.ConnConfig.DefaultQueryExecMode = mode
+			pool, err := pgxpool.NewWithConfig(t.Context(), configuration)
+			require.NoError(t, err)
+			defer pool.Close()
+			store, err := New(&Options{Pool: pool})
+			require.NoError(t, err)
+			emitter, err := NewEmitter(&EmitterOptions{Store: store, FlushInterval: time.Hour})
+			require.NoError(t, err)
+			defer func() { require.NoError(t, emitter.Close(t.Context())) }()
+			_, err = ensurePartitions(t.Context(), pool, []time.Time{store.today()})
+			require.NoError(t, err)
+			batch := make([]row, 0, 3)
+			for range cap(batch) {
+				eventRow, _ := emitter.rowOf(wideevent.Begin(nil, "event"))
+				batch = append(batch, eventRow)
+			}
+
+			require.NoError(t, emitter.copyRows(t.Context(), batch[:2]))
+			require.NoError(t, emitter.insertNew(t.Context(), batch))
+			require.NoError(t, emitter.insertNew(t.Context(), batch))
+
+			var count int
+			require.NoError(t, pool.QueryRow(t.Context(), "SELECT count(*) FROM govengers_wide_events").Scan(&count))
+			require.Equal(t, 3, count)
+		})
 	}
+}
 
-	start := time.Now()
-	require.NoError(t, emitter.copyRows(t.Context(), batch[:2]))
-	t.Log("copy", time.Since(start))
-	require.NoError(t, emitter.insertNew(t.Context(), batch))
-	t.Log("insert", time.Since(start))
-	require.NoError(t, emitter.insertNew(t.Context(), batch))
-	t.Log("insert2", time.Since(start))
-
-	var count int
-	require.NoError(t, pool.QueryRow(t.Context(), "SELECT count(*) FROM govengers_wide_events").Scan(&count))
-	require.Equal(t, 3, count)
+func TestBackoffDoublesUpToTheCapWithJitter(t *testing.T) {
+	for attempt, expected := range map[int]time.Duration{
+		1:  time.Second,
+		2:  2 * time.Second,
+		4:  8 * time.Second,
+		5:  maximumRetryDelay,
+		62: maximumRetryDelay,
+	} {
+		delay := backoff(time.Second, attempt)
+		require.GreaterOrEqual(t, delay, expected, attempt)
+		require.LessOrEqual(t, delay, expected+expected/5, attempt)
+	}
+	require.Equal(t, time.Duration(0), backoff(0, 1), "no jitter panics on a zero delay")
 }
 
 func TestDatabaseErrorKeepsTheContextsEnd(t *testing.T) {

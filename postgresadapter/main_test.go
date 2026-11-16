@@ -147,14 +147,17 @@ func newFixture(t *testing.T, options *postgresadapter.Options) *fixture {
 	return &fixture{pool: pool, store: store, clock: testClock, recorder: observer}
 }
 
-// emitter starts an emitter on the fixture's store and closes it when the test ends.
+// emitter starts an emitter on the fixture's store, retrying without a real backoff, and closes it
+// when the test ends.
 func (f *fixture) emitter(t *testing.T, options *postgresadapter.EmitterOptions) *postgresadapter.Emitter {
 	t.Helper()
 	if options == nil {
 		options = &postgresadapter.EmitterOptions{}
 	}
-	options.Store = f.store
-	emitter, err := postgresadapter.NewEmitter(options)
+	if options.Store == nil {
+		options.Store = f.store
+	}
+	emitter, err := postgresadapter.NewEmitterWithRetryDelay(options, time.Nanosecond)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, emitter.Close(context.Background())) })
 	return emitter

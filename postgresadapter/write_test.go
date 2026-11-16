@@ -1,11 +1,16 @@
 package postgresadapter_test
 
 import (
+	"context"
 	"encoding/json"
+	"net"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
 	wideevent "github.com/govengers/wide-event-logger"
@@ -71,6 +76,51 @@ func TestEmitterRetriesAfterALostConnection(t *testing.T) {
 	require.NoError(t, emitter.Flush(t.Context()))
 
 	require.ElementsMatch(t, []string{"before", "after"}, storedNames(t, fixture.store))
+}
+
+// A restart or failover refuses connections for a while: the writer backs off and retries until
+// the database accepts them again, and the queue holds what arrives meanwhile.
+func TestEmitterWaitsForADatabaseThatRefusesConnections(t *testing.T) {
+	fixture := newFixture(t, nil)
+	require.NoError(t, fixture.store.Maintain(t.Context()))
+	var refusals atomic.Int32
+	configuration := fixture.pool.Config()
+	dialer := &net.Dialer{}
+	configuration.ConnConfig.DialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if refusals.Add(-1) >= 0 {
+			return nil, syscall.ECONNREFUSED
+		}
+		return dialer.DialContext(ctx, network, address)
+	}
+	pool, err := pgxpool.NewWithConfig(t.Context(), configuration)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	store, err := postgresadapter.New(&postgresadapter.Options{Pool: pool, Now: fixture.clock.Now, Observer: fixture.recorder})
+	require.NoError(t, err)
+	emitter := fixture.emitter(t, &postgresadapter.EmitterOptions{Store: store, FlushInterval: time.Hour})
+	refusals.Store(4) // more attempts than one retry
+
+	emitEvent(emitter, "during_the_outage", nil)
+	require.NoError(t, emitter.Flush(t.Context()))
+
+	require.Equal(t, []string{"during_the_outage"}, storedNames(t, fixture.store))
+	require.Negative(t, refusals.Load(), "every refusal was retried")
+}
+
+// A connection lost on the first attempt and a day without a partition on the retry: the
+// partition is created and the batch, one event, is stored.
+func TestEmitterCreatesAMissingPartitionAfterALostConnection(t *testing.T) {
+	fixture := newFixture(t, nil)
+	emitter := fixture.emitter(t, &postgresadapter.EmitterOptions{FlushInterval: time.Hour})
+	emitEvent(emitter, "today", nil)
+	require.NoError(t, emitter.Flush(t.Context()))
+	fixture.terminateConnections(t)
+	fixture.clock.Set(testDay.Add(day + time.Hour)) // no Maintain created the next day
+
+	emitEvent(emitter, "tomorrow", nil)
+	require.NoError(t, emitter.Flush(t.Context()))
+
+	require.ElementsMatch(t, []string{"today", "tomorrow"}, storedNames(t, fixture.store))
 }
 
 func TestFlushReturnsTheErrorOfAWriteBeforeIt(t *testing.T) {

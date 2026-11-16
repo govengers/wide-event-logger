@@ -52,8 +52,8 @@ an attempt decides what follows (RES-002), classified before the pgx error is fl
 
 | Failure | Next |
 |---|---|
-| connection error without a server reply, SQLSTATE class 08, 57P, 53, 40001, 40P01 | one retry at once: a pool connection killed by a database restart fails, a fresh one serves the retry |
-| 23514 (no partition for the day) | create the missing days (W6), then one retry; a 23514 after that is a CHECK constraint of the application, so data |
+| connection error without a server reply, SQLSTATE class 08, 57P, 53, 40001, 40P01 | retries with backoff (W13): a pool connection killed by a restart fails, a fresh one serves the retry; a database that refuses connections for a while is waited for |
+| 23514 (no partition for the day) | create the missing days (W6), then one retry; a 23514 after that is a CHECK constraint of the application, so data. Also when the 23514 answers a retry after a transient failure |
 | class 22, 23, 54 (the database refuses a value of a row) | split the batch in halves and write each, down to the single refused row |
 | the attempt's own `WriteTimeout`, the emitter aborted by `Close`, anything else (42501) | none: the batch is lost |
 
@@ -63,9 +63,8 @@ fits one statement), so a COPY that committed although its acknowledgement was l
 twice. IDs count up per emitter from a random start: emit order breaks ties of `time`, and two
 emitters share a `(time, id)` only within one microsecond and with overlapping number ranges, in
 which case the second row is refused alone (23505) by the split. A deadline is not retried: a slow
-database would get the same batch again at once while the queue overflows. The retry runs at once,
-without a backoff (RES-003): it is a single second attempt on another connection, and a sleeping
-writer would only fill the queue.
+database would get the same batch again at once while the queue overflows. The retry statement is
+sent in `QueryExecModeDescribeExec`, so its arrays encode on a pool in any exec mode.
 
 The split replaces a list of known causes (W9 removes them at the source, but a json.RawMessage
 from a remote party, an application constraint or a jsonb limit can still refuse a row): a refused
@@ -130,7 +129,7 @@ the events fetched so far, not a read of the whole day. Each line is the event p
 `time` (RFC 3339 UTC with microseconds), which replaces a field of that key as `level` and
 `message` do in the JSON emitter: the emit time is otherwise only in the `time` column, and an
 archive without it could never be repaired. A `Maintain` whose context ends starts no further
-archive; the remaining days wait for the next run. Errors keep the end of the context (`errors.Is`
+archive, nor does one whose connection closed; the remaining days wait for the next run. Errors keep the end of the context (`errors.Is`
 with `context.Canceled` works), so a scheduler tells a shutdown from a failing database. The day counts as archived only when the
 Archiver returned nil and the stream ended cleanly; an Archiver that returns nil before reading to
 the end fails the day, so a short upload never leads to a drop. A failed day keeps its partition,
@@ -165,7 +164,7 @@ own migration when the text search is hot.
 
 `Observer` (LIB-012) receives `EventQueued`, `EventDropped`, `BatchWritten`, `Maintained` and
 `DayArchived`. `prometheusadapter.Metrics` implements it on the caller's registerer (LIB-011):
-queued, written, dropped by reason (`queue_full`, `closed`, `write_failed` for the events of a
+queued, written, dropped by reason (`queue_full`, `closed`, `expired` (W14), `write_failed` for the events of a
 failed batch), flush duration by outcome, maintenance runs, partitions created and dropped, archive
 results and duration. Label values are closed sets and pre-created at zero.
 
@@ -177,6 +176,34 @@ to REPEATABLE READ, and they were checked to fail without the advisory lock and 
 COMMITTED pin. No test sleeps: they wait for observer reports or use `Flush`, and clocks are
 injected. The harness unpacks the cached PostgreSQL archive with the system `tar` (2 s) instead of
 the library's xz decoder, which takes 30-40 s inside a `-race` test binary.
+
+### W13 Transient failures are retried with exponential backoff
+
+Round 1 retried a transient failure once, at once. A database that refuses connections (a restart,
+a failover) then lost every batch flushed during the outage within milliseconds, while the queue,
+which exists to buffer exactly that, stayed empty. Now a transient failure is attempted up to 10
+times, waiting 100 ms doubled per attempt up to 10 s, plus 0-20 % jitter (RES-003): about 33 s in
+all, which spans a restart or a failover. The wait is a `select` on the writer's context, so
+`Close` with an ended context still stops it at once. Meanwhile the writer reads no new events:
+the queue fills, and only an overflow drops (counted as `queue_full`). The cost: `Flush` and
+`Close` wait for the retries during an outage, so `Close` needs a context with the shutdown
+deadline. A deadline of an attempt (`WriteTimeout`) is still not retried. The tests start the
+backoff at 1 ns through an unexported constructor, so no test waits.
+
+### W14 The writer never writes into a day Maintain may archive
+
+An event can wait in the emitter for long (a backlog of `QueueSize/BatchSize` batches, each up to
+10 attempts of `WriteTimeout`). If its day expired meanwhile, its write could commit after
+`Maintain` streamed the day to the Archiver and before the drop, so it was dropped without being
+archived; or, after the drop, recreate the day's partition, which the next `Maintain` archives
+again, overwriting the day's archive with the late events. Locking the day against writers during
+the archive would hold a lock for as long as the upload takes and conflicts with the table lock
+order of W6. Instead the writer fences: before each write it drops (`DropExpired`, reported per
+event) the events whose day leaves the retention within one hour plus the longest write
+(`10 x (WriteTimeout + 10 s)`), measured on the store clock. `Maintain` drops a day only after it
+left the retention, so a write in flight or a replica clock up to an hour behind cannot reach a
+day being archived. With `RetentionDays` zero nothing is fenced. Normal events are written within
+seconds and never reach the fence; it costs one comparison per event.
 
 ### Not done
 

@@ -138,6 +138,24 @@ func TestEmitterFlushReturnsTheWriteError(t *testing.T) {
 	err := emitter.Flush(t.Context())
 
 	require.ErrorContains(t, err, "write 1 events")
+	require.NotErrorIs(t, err, context.DeadlineExceeded, "WriteTimeout is not the end of Flush's context")
+}
+
+// An event that waited in the queue until Maintain may archive its day is dropped: it would land
+// in a day while it is archived, or recreate the partition of a dropped day.
+func TestEmitterDropsAnEventWhoseDayIsAboutToExpire(t *testing.T) {
+	fixture := newFixture(t, &postgresadapter.Options{RetentionDays: 1})
+	emitter := fixture.emitter(t, &postgresadapter.EmitterOptions{FlushInterval: time.Hour})
+	emitEvent(emitter, "late", nil)
+	fixture.clock.Set(testDay.Add(2*day - 30*time.Minute)) // Maintain drops the first day in 30 minutes
+	emitEvent(emitter, "current", nil)
+
+	require.NoError(t, emitter.Flush(t.Context()))
+
+	require.Equal(t, []string{"current"}, storedNames(t, fixture.store))
+	require.Equal(t, []string{partitionOf(testDay.Add(day))}, fixture.partitions(t), "the expired day is not created")
+	_, dropped := fixture.recorder.counts()
+	require.Equal(t, 1, dropped[postgresadapter.DropExpired])
 }
 
 func TestEmitterKeepsOnlyTheChosenLevels(t *testing.T) {

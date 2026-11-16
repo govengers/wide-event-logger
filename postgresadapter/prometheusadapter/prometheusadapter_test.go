@@ -29,9 +29,10 @@ func TestMetricsCountEveryReport(t *testing.T) {
 	metrics.DayArchived(&postgresadapter.Archive{Duration: time.Second, Err: failure})
 
 	expected := `
-# HELP app_wide_events_dropped_total Wide events lost: the queue was full, the emitter closed, or the write failed.
+# HELP app_wide_events_dropped_total Wide events lost: the queue was full, the emitter closed, the event outlived the retention in the queue, or the write failed.
 # TYPE app_wide_events_dropped_total counter
 app_wide_events_dropped_total{reason="closed"} 0
+app_wide_events_dropped_total{reason="expired"} 0
 app_wide_events_dropped_total{reason="queue_full"} 1
 app_wide_events_dropped_total{reason="write_failed"} 3
 # HELP app_wide_events_queued_total Wide events queued for the database.

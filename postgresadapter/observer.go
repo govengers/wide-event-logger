@@ -10,7 +10,8 @@ import "time"
 type Observer interface {
 	// EventQueued reports an event Emit put into the queue.
 	EventQueued()
-	// EventDropped reports an event Emit could not queue.
+	// EventDropped reports an event that is not written: Emit could not queue it, or it waited in
+	// the queue until its day was about to leave the retention.
 	EventDropped(reason DropReason)
 	// BatchWritten reports one write of queued events, successful or not. A failed batch is lost.
 	// A batch the database refused for a row is split, and each part is reported on its own.
@@ -21,19 +22,20 @@ type Observer interface {
 	DayArchived(archive *Archive)
 }
 
-// DropReason says why Emit dropped an event.
+// DropReason says why an event was dropped.
 type DropReason string
 
 // The reasons an Observer receives.
 const (
 	DropQueueFull DropReason = "queue_full" // the writer is behind: the database is slow or down
 	DropClosed    DropReason = "closed"     // Emit after Close
+	DropExpired   DropReason = "expired"    // the event waited until Maintain may archive its day
 )
 
 // Batch is one write of queued events.
 type Batch struct {
 	Events   int           // events in the batch, written or, with Err, lost
-	Duration time.Duration // of both attempts when the first one was retried
+	Duration time.Duration // of every attempt and the waits between them
 	Err      error
 }
 

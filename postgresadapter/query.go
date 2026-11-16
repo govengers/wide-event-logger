@@ -50,7 +50,7 @@ type Filter struct {
 
 // Record is one stored event.
 type Record struct {
-	ID        int64
+	ID        int64     // assigned by the emitter, below 2^53: exact as a JSON number
 	Time      time.Time // when the event was emitted, in UTC, to the microsecond
 	Name      string
 	Level     string

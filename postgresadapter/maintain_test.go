@@ -339,3 +339,32 @@ func TestMaintainStopsArchivingWhenItsContextEnds(t *testing.T) {
 	require.Equal(t, 1, calls, "no archive starts after the context ended")
 	require.Subset(t, fixture.partitions(t), []string{partitionOf(testDay), partitionOf(testDay.Add(day)), partitionOf(testDay.Add(2 * day))}, "every day is kept")
 }
+
+func TestMaintainStopsArchivingWhenItsConnectionCloses(t *testing.T) {
+	var fixture *fixture
+	calls := 0
+	terminating := postgresadapter.ArchiverFunc(func(_ context.Context, _ time.Time, events io.Reader) error {
+		calls++
+		if _, err := gzip.NewReader(events); err != nil { // the cursor has fetched once
+			return err
+		}
+		_, err := fixture.pool.Exec(context.Background(),
+			"SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE query LIKE 'FETCH % FROM archived_day'")
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(io.Discard, events)
+		return err
+	})
+	fixture = newFixture(t, &postgresadapter.Options{RetentionDays: 1, Archiver: terminating})
+	for offset := range 4 {
+		fixture.emitOn(t, testDay.Add(time.Duration(offset)*day), "event")
+	}
+	fixture.clock.Set(testDay.Add(6 * day))
+
+	err := fixture.store.Maintain(t.Context())
+
+	require.ErrorContains(t, err, "the maintenance connection closed")
+	require.Equal(t, 1, calls, "no archive starts on a closed connection")
+	require.Subset(t, fixture.partitions(t), []string{partitionOf(testDay), partitionOf(testDay.Add(3 * day))}, "every day is kept")
+}

@@ -34,7 +34,7 @@ type Options struct {
 //
 //	<namespace>_wide_events_queued_total
 //	<namespace>_wide_events_written_total
-//	<namespace>_wide_events_dropped_total{reason="queue_full|closed|write_failed"}
+//	<namespace>_wide_events_dropped_total{reason="queue_full|closed|expired|write_failed"}
 //	<namespace>_wide_events_flush_duration_seconds{outcome}
 //	<namespace>_wide_events_maintenance_total{outcome}
 //	<namespace>_wide_events_partitions_created_total, _partitions_dropped_total
@@ -91,8 +91,8 @@ func newMetrics(namespace string) *Metrics {
 	metrics := &Metrics{
 		queued:  counter("queued_total", "Wide events queued for the database."),
 		written: counter("written_total", "Wide events written to the database."),
-		dropped: counterVec("dropped_total", "Wide events lost: the queue was full, the emitter closed, or the write failed.", "reason",
-			string(postgresadapter.DropQueueFull), string(postgresadapter.DropClosed), dropWriteFailed),
+		dropped: counterVec("dropped_total", "Wide events lost: the queue was full, the emitter closed, the event outlived the retention in the queue, or the write failed.", "reason",
+			string(postgresadapter.DropQueueFull), string(postgresadapter.DropClosed), string(postgresadapter.DropExpired), dropWriteFailed),
 		flushDurations: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: namespace, Subsystem: subsystem, Name: "flush_duration_seconds",
 			Help: "Duration of the batch writes of wide events.", Buckets: prometheus.DefBuckets,

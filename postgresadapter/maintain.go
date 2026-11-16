@@ -75,15 +75,18 @@ func (s *Store) maintain(ctx context.Context, maintenance *Maintenance) error {
 	if s.retentionDays == 0 {
 		return createError
 	}
-	dropped, dropError := s.dropExpired(ctx, connection, s.retentionCutoff())
+	dropped, dropError := s.dropExpired(ctx, connection, s.retentionCutoff(s.now()))
 	maintenance.Dropped = dropped
 	return errors.Join(createError, dropError)
 }
 
-// retentionCutoff is the first day the retention keeps; AddDate cannot overflow like a Duration
-// of many days would.
-func (s *Store) retentionCutoff() time.Time {
-	return s.today().AddDate(0, 0, -s.retentionDays)
+// retentionCutoff is the first day the retention keeps at instant, or zero when it keeps every
+// day; AddDate cannot overflow like a Duration of many days would.
+func (s *Store) retentionCutoff(instant time.Time) time.Time {
+	if s.retentionDays == 0 {
+		return time.Time{}
+	}
+	return instant.UTC().Truncate(day).AddDate(0, 0, -s.retentionDays)
 }
 
 // lockMaintenance waits for Maintain's advisory lock on a connection of its own and returns it
@@ -129,6 +132,10 @@ func (s *Store) dropExpired(ctx context.Context, connection *pgxpool.Conn, cutof
 		}
 		if ctx.Err() != nil {
 			errs = append(errs, ctx.Err()) // the days left wait for the next run
+			break
+		}
+		if connection.Conn().IsClosed() {
+			errs = append(errs, errors.New("the maintenance connection closed")) // the days left wait for the next run
 			break
 		}
 		if s.archiver != nil {
