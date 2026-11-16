@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `postgresadapter`: stores wide events in PostgreSQL 18. `NewEmitter` queues events without blocking and writes them in batches with COPY; `Store.Maintain` keeps one partition per UTC day, drops days after `RetentionDays` and hands each day to an optional `Archiver` as gzip NDJSON first; `Store.Query` pages through events for a log viewer. `MigrationV1` is the goose DDL. Design: [docs/design.md](docs/design.md) W1-W14.
+- `postgresadapter/prometheusadapter`: metrics of the emitter and the store on the caller's registry.
+- `Event.Level()` with `LevelInfo`, `LevelWarning`, `LevelError`, and `Event.JSON()`, the JSON emitter's line.
+- `KeyRequestID`, `KeyUserID`, `KeyTraceID`: the keys of `request.id`, `user.id` and `trace.id`.
+
 ## 1.0.0
 
 First release under `github.com/govengers/wide-event-logger`. `github.com/mxcd/go-wide-event-logger` is deprecated and stays at v0.3.x.

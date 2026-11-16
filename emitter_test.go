@@ -283,3 +283,22 @@ func TestJSONEmitterNeverFormatsAMarshalError(t *testing.T) {
 	document := emitJSON(t, func(we *Event) { we.Set("broken", failingMarshaler{}) })
 	require.Equal(t, "!unencodable wideevent.failingMarshaler", document["broken"])
 }
+
+func TestJSONIsTheJSONEmittersLine(t *testing.T) {
+	var buffer bytes.Buffer
+	we := Begin(NewJSONEmitter(&JSONEmitterOptions{Writer: &buffer}), "job")
+	we.String("db.operation", "update").Int(KeyResponseStatus, 404)
+	we.Emit()
+
+	encoded := we.JSON()
+
+	require.Equal(t, strings.TrimSuffix(buffer.String(), "\n"), string(encoded))
+	require.Equal(t, LevelWarning, we.Level())
+	var nilEvent *Event
+	require.Equal(t, "null", string(nilEvent.JSON()))
+}
+
+func TestJSONEmitterWritesAnEventReachableFromItsOwnFields(t *testing.T) {
+	document := emitJSON(t, func(we *Event) { we.Set("self", we) })
+	require.Equal(t, map[string]any{}, document["self"], "an event has no exported fields; it must not recurse")
+}

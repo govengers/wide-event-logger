@@ -91,6 +91,17 @@ func (emitter *JSONEmitter) Emit(we *Event) {
 	}
 }
 
+// JSON returns the line the JSONEmitter writes for we, without the newline: always valid JSON,
+// whatever the field values are. A nil event is null. It is not MarshalJSON on purpose: an event
+// reachable from its own fields would then recurse until the stack overflows.
+func (we *Event) JSON() []byte {
+	if we == nil {
+		return []byte("null")
+	}
+	line := jsonLine(we)
+	return line[:len(line)-1]
+}
+
 // jsonLine encodes every field value on its own, so one value JSON cannot encode costs that value only.
 func jsonLine(we *Event) []byte {
 	fields := we.Fields()
@@ -115,7 +126,7 @@ func jsonLine(we *Event) []byte {
 
 // encodeDocument adds level and message to document and encodes it.
 func encodeDocument(document map[string]any, we *Event) []byte {
-	document["level"] = levelOf(we)
+	document["level"] = we.Level()
 	document["message"] = defaultEventMessage
 	line, err := marshalJSON(document)
 	if err != nil {
@@ -191,11 +202,11 @@ func finiteFloat(value float64) any {
 	return value
 }
 
-// Log levels the emitters derive from an event.
+// Log levels an event's Level returns.
 const (
-	levelInfo    = "info"
-	levelWarning = "warn"
-	levelError   = "error"
+	LevelInfo    = "info"
+	LevelWarning = "warn"
+	LevelError   = "error"
 )
 
 // defaultEventMessage is the JSON message of every event and the dev title of an event without a name.
@@ -204,13 +215,14 @@ const defaultEventMessage = "wide_event"
 // minimumClientErrorStatus is the first response status logged as a warning.
 const minimumClientErrorStatus = 400
 
-// levelOf derives the log level: error for HasError, warn for a 4xx response, info otherwise.
-func levelOf(we *Event) string {
+// Level returns the log level the emitters write: LevelError when HasError, LevelWarning for a 4xx
+// response, LevelInfo otherwise.
+func (we *Event) Level() string {
 	if we.HasError() {
-		return levelError
+		return LevelError
 	}
 	if we.StatusCode() >= minimumClientErrorStatus {
-		return levelWarning
+		return LevelWarning
 	}
-	return levelInfo
+	return LevelInfo
 }

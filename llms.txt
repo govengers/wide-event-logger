@@ -1,0 +1,25 @@
+# govengers/wide-event-logger
+
+> Wide event logging for Go: one structured event per unit of work (request, job, cron run), enriched by every layer through the context and emitted once. JSON and dev emitters, tail sampling, a Gin middleware, and a PostgreSQL store with day partitions, retention, archive hook and a log viewer query.
+
+- Module: `github.com/govengers/wide-event-logger`, Go 1.26, MIT.
+- Packages: `wideevent` (root: Event, Begin, NewContext/FromContext, emitters, samplers), `ginadapter` (Gin middleware), `postgresadapter` (Emitter, Store with Maintain and Query, MigrationV1, Archiver, Observer), `postgresadapter/prometheusadapter` (Observer as Prometheus metrics).
+- Standards: govengers/standards, `library` profile.
+- Rule of thumb: name the event variable `we`; never write to an event after Emit; the Gin middleware emits request events itself.
+
+## Docs
+
+- [README.md](README.md): event API, emitters, sampling, the Gin middleware, the PostgreSQL store.
+- [docs/design.md](docs/design.md): design decisions W1 onwards (postgresadapter).
+- [CHANGELOG.md](CHANGELOG.md): changes; the 1.0.0 entry is the migration guide from `github.com/mxcd/go-wide-event-logger`.
+
+## postgresadapter in short
+
+- Apply `postgresadapter.MigrationV1` in a goose migration. Table `govengers_wide_events`, partitioned by UTC day of the emit time, columns time, id, name, level, outcome, status, duration_ms, user_id, request_id, trace_id, event (jsonb).
+- `store, _ := postgresadapter.New(&postgresadapter.Options{Pool, RetentionDays, Archiver, Observer, Now})`.
+- `emitter, _ := postgresadapter.NewEmitter(&postgresadapter.EmitterOptions{Store: store})`; starts one writer goroutine; `defer emitter.Close(ctx)`. Emit never blocks; a full queue drops and reports `EventDropped`. Compose with `wideevent.MultiEmitter` and `wideevent.SampledEmitter`; `Levels` and `Outcomes` filter.
+- `store.Maintain(ctx)` at startup and daily (govengers/jobs schedule): creates today plus 3 days, archives then drops days older than RetentionDays; safe on several replicas; a failed archive keeps the day.
+- `store.Query(ctx, &postgresadapter.Filter{From, To, Name, Level, Outcome, UserID, RequestID, TraceID, MinimumStatus, MaximumStatus, Text, Limit, Cursor})` returns `*Page{Records, Next}`, newest first, Limit at most 1000.
+- An Archiver gets `(ctx, day, io.Reader)` with gzip NDJSON (each line the event plus a root `time`, RFC 3339 UTC), must read to the end, and should overwrite by day key (a day may be archived again).
+- Event IDs are assigned by the emitter (below 2^53, safe as a JSON number), so retries after a refused or reset connection (up to 10 attempts, exponential backoff, about 33 s) skip what was stored; a host that stops answering runs into WriteTimeout, which is not retried; a row the database refuses costs only itself. Pass `Close` a context with the shutdown deadline.
+- An event whose day leaves the retention within the next hour is dropped (`DropExpired`), never written into a day Maintain archives. Give every Store behind an emitter the RetentionDays of the Store that runs Maintain.
