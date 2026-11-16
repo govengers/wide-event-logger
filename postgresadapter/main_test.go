@@ -135,10 +135,15 @@ type fixture struct {
 
 func newFixture(t *testing.T, options *postgresadapter.Options) *fixture {
 	t.Helper()
+	return newFixtureOn(t, postgresadapter.Postgres.Pool(t), options)
+}
+
+// newFixtureOn is newFixture on a pool the test set up itself.
+func newFixtureOn(t *testing.T, pool *pgxpool.Pool, options *postgresadapter.Options) *fixture {
+	t.Helper()
 	if options == nil {
 		options = &postgresadapter.Options{}
 	}
-	pool := postgresadapter.Postgres.Pool(t)
 	testClock := newClock(testDay.Add(12 * time.Hour))
 	observer := newRecorder()
 	options.Pool, options.Now, options.Observer = pool, testClock.Now, observer
