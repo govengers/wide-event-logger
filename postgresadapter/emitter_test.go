@@ -158,6 +158,17 @@ func TestEmitterDropsAnEventWhoseDayIsAboutToExpire(t *testing.T) {
 	require.Equal(t, 1, dropped[postgresadapter.DropExpired])
 }
 
+func TestEmitterNeverFencesToday(t *testing.T) {
+	fixture := newFixture(t, &postgresadapter.Options{RetentionDays: 1})
+	emitter := fixture.emitter(t, &postgresadapter.EmitterOptions{FlushInterval: time.Hour, WriteTimeout: 3 * time.Hour})
+	fixture.clock.Set(testDay.Add(20 * time.Hour)) // the grace of the longest write reaches past midnight
+	emitEvent(emitter, "current", nil)
+
+	require.NoError(t, emitter.Flush(t.Context()))
+
+	require.Equal(t, []string{"current"}, storedNames(t, fixture.store))
+}
+
 func TestEmitterKeepsOnlyTheChosenLevels(t *testing.T) {
 	fixture := newFixture(t, nil)
 	emitter := fixture.emitter(t, &postgresadapter.EmitterOptions{Levels: []string{wideevent.LevelWarning, wideevent.LevelError}})

@@ -36,7 +36,8 @@ const maximumUnreportedErrors = 16
 
 // A write that failed on the connection or the server is attempted up to maximumAttempts times,
 // waiting from retryBaseDelay, doubling up to maximumRetryDelay, with jitter (RES-003): about 33 s
-// in all, which spans a database restart or failover while the queue buffers what arrives.
+// in all, which spans a database restart or failover that refuses or resets connections while the
+// queue buffers what arrives. A host that stops answering runs into WriteTimeout, which is not retried.
 const (
 	maximumAttempts   = 10
 	retryBaseDelay    = 100 * time.Millisecond
@@ -324,6 +325,9 @@ func (e *Emitter) write(ctx context.Context, batch []row) (err error) {
 // event is kept.
 func (e *Emitter) withoutExpired(batch []row) []row {
 	fence := e.store.retentionCutoff(e.store.now().Add(expiryGrace + maximumAttempts*(e.writeTimeout+maximumRetryDelay)))
+	if today := e.store.today(); fence.After(today) {
+		fence = today // a long WriteTimeout must not fence today: Maintain never drops it
+	}
 	if fence.IsZero() || !slices.ContainsFunc(batch, func(eventRow row) bool { return eventRow.time.Before(fence) }) {
 		return batch
 	}

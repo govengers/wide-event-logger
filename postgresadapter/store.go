@@ -43,7 +43,8 @@ type Store struct {
 type Options struct {
 	Pool *pgxpool.Pool // required; its search_path must reach the table of MigrationV1
 	// RetentionDays is how many full days Maintain keeps before today's; older days are dropped,
-	// after the Archiver stored them. Zero keeps every day.
+	// after the Archiver stored them. Zero keeps every day. Emitters fence by it too: every Store
+	// behind an Emitter must carry the retention of the Store that runs Maintain.
 	RetentionDays int
 	Archiver      Archiver // optional; receives each day before it is dropped
 	Observer      Observer // optional; nil reports nothing

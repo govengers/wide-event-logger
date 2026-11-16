@@ -183,7 +183,9 @@ Round 1 retried a transient failure once, at once. A database that refuses conne
 a failover) then lost every batch flushed during the outage within milliseconds, while the queue,
 which exists to buffer exactly that, stayed empty. Now a transient failure is attempted up to 10
 times, waiting 100 ms doubled per attempt up to 10 s, plus 0-20 % jitter (RES-003): about 33 s in
-all, which spans a restart or a failover. The wait is a `select` on the writer's context, so
+all, which spans a restart or a failover as long as the database refuses or resets connections.
+A host that stops answering (node loss, network partition) blocks the dial or the COPY until
+`WriteTimeout`, which is not retried, so its batches are lost (W4). The wait is a `select` on the writer's context, so
 `Close` with an ended context still stops it at once. Meanwhile the writer reads no new events:
 the queue fills, and only an overflow drops (counted as `queue_full`). The cost: `Flush` and
 `Close` wait for the retries during an outage, so `Close` needs a context with the shutdown
@@ -202,7 +204,10 @@ order of W6. Instead the writer fences: before each write it drops (`DropExpired
 event) the events whose day leaves the retention within one hour plus the longest write
 (`10 x (WriteTimeout + 10 s)`), measured on the store clock. `Maintain` drops a day only after it
 left the retention, so a write in flight or a replica clock up to an hour behind cannot reach a
-day being archived. With `RetentionDays` zero nothing is fenced. Normal events are written within
+day being archived. The fence never reaches today, which `Maintain` never drops, whatever the
+`WriteTimeout`. The fence uses the `RetentionDays` of the emitter's own Store: every Store behind an
+emitter must carry the retention of the Store that runs `Maintain`. With `RetentionDays` zero
+nothing is fenced. Normal events are written within
 seconds and never reach the fence; it costs one comparison per event.
 
 ### Not done
