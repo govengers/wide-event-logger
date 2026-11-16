@@ -207,7 +207,7 @@ Design decisions: [docs/design.md](docs/design.md).
 just check   # lint, unit tests with coverage gate, e2e tests, govulncheck
 ```
 
-The `postgresadapter` tests start one embedded PostgreSQL 18 per test binary (downloaded once into `~/.embedded-postgres-go`) and give every test its own schema.
+The `postgresadapter` tests use [govengers/postgrestest](https://github.com/govengers/postgrestest): one embedded PostgreSQL 18 per test binary (binaries downloaded and unpacked once into `~/.embedded-postgres-go`), and every test gets its own database, a copy of a template with `MigrationV1` applied. With `POSTGRESTEST_URL` set they run against that server instead.
 
 ## Changes
 
