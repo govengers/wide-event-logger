@@ -3,8 +3,8 @@ module github.com/govengers/wide-event-logger
 go 1.26.0
 
 require (
-	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/gin-gonic/gin v1.12.0
+	github.com/govengers/postgrestest v0.0.0-20261116042556-e8a91e54648c
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/mattn/go-isatty v0.0.24
 	github.com/prometheus/client_golang v1.25.0
@@ -19,6 +19,7 @@ require (
 	github.com/bytedance/sonic/loader v0.5.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudwego/base64x v0.1.7 // indirect
+	github.com/fergusstrange/embedded-postgres v1.34.0 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.16 // indirect
 	github.com/gin-contrib/sse v1.1.2 // indirect
 	github.com/go-playground/locales v0.14.2 // indirect

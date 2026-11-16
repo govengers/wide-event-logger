@@ -3,7 +3,6 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 gotestsum := "go run gotest.tools/gotestsum@v1.13.0"
 govulncheck := "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0"
 coverage_threshold := "80"
-coverage_excluded := "/internal/postgrestest/"
 
 default:
     @just --list
@@ -14,11 +13,10 @@ lint:
     go vet -tags e2e ./test/e2e/...
     golangci-lint run ./...
 
-# Unit tests with the race detector; the PostgreSQL tests share one embedded instance per package. A hanging test fails after 3 minutes, not the default 10. Fails below the coverage threshold (the test harness is not counted)
+# Unit tests with the race detector; the PostgreSQL tests share one embedded instance per package (govengers/postgrestest) and get a database each. A hanging test fails after 3 minutes, not the default 10. Fails below the coverage threshold
 test:
     mkdir -p sandbox
-    {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -timeout 3m -coverprofile=sandbox/unit.raw.cover ./...
-    grep -v -E '{{coverage_excluded}}' sandbox/unit.raw.cover > sandbox/unit.cover
+    {{gotestsum}} --format testname --jsonfile sandbox/unit.json -- -race -timeout 3m -coverprofile=sandbox/unit.cover ./...
     go tool cover -func=sandbox/unit.cover > sandbox/unit.func
     awk -v threshold={{coverage_threshold}} '/^total:/ { found = 1; sub("%", "", $3); print "coverage " $3 "%"; if ($3 + 0 < threshold) { print "coverage is below " threshold "%"; exit 1 } } END { if (!found) { print "no coverage total"; exit 1 } }' sandbox/unit.func
 

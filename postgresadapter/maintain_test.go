@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
@@ -286,9 +287,9 @@ FOR VALUES FROM ('2000-01-01 00:00:00+00') TO ('2001-01-01 00:00:00+00')`)
 	require.Contains(t, fixture.partitions(t), "govengers_wide_events_legacy")
 }
 
-func TestMaintainArchivesEachEventWithItsTime(t *testing.T) {
-	var lines []map[string]any
-	keepLines := postgresadapter.ArchiverFunc(func(_ context.Context, _ time.Time, events io.Reader) error {
+// keepLines is an Archiver that appends every archived NDJSON line to lines.
+func keepLines(lines *[]map[string]any) postgresadapter.ArchiverFunc {
+	return func(_ context.Context, _ time.Time, events io.Reader) error {
 		decompressed, err := gzip.NewReader(events)
 		if err != nil {
 			return err
@@ -299,11 +300,15 @@ func TestMaintainArchivesEachEventWithItsTime(t *testing.T) {
 			if err := json.Unmarshal(scanner.Bytes(), &line); err != nil {
 				return err
 			}
-			lines = append(lines, line)
+			*lines = append(*lines, line)
 		}
 		return scanner.Err()
-	})
-	fixture := newFixture(t, &postgresadapter.Options{RetentionDays: 1, Archiver: keepLines})
+	}
+}
+
+func TestMaintainArchivesEachEventWithItsTime(t *testing.T) {
+	var lines []map[string]any
+	fixture := newFixture(t, &postgresadapter.Options{RetentionDays: 1, Archiver: keepLines(&lines)})
 	fixture.emitOn(t, testDay, "job")
 	// more events than one read of the cursor fetches
 	_, err := fixture.pool.Exec(t.Context(), `INSERT INTO govengers_wide_events (time, id, name, level, event)
@@ -349,7 +354,7 @@ func TestMaintainStopsArchivingWhenItsConnectionCloses(t *testing.T) {
 			return err
 		}
 		_, err := fixture.pool.Exec(context.Background(),
-			"SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE query LIKE 'FETCH % FROM archived_day'")
+			"SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'FETCH % FROM archived_day'")
 		if err != nil {
 			return err
 		}
@@ -367,4 +372,59 @@ func TestMaintainStopsArchivingWhenItsConnectionCloses(t *testing.T) {
 	require.ErrorContains(t, err, "the maintenance connection closed")
 	require.Equal(t, 1, calls, "no archive starts on a closed connection")
 	require.Subset(t, fixture.partitions(t), []string{partitionOf(testDay), partitionOf(testDay.Add(3 * day))}, "every day is kept")
+}
+
+// The table lives in a schema that comes after an empty one in the search_path, and the session
+// runs in a zone other than UTC: partitions land next to the table, and days and archived times
+// stay UTC whatever the session's TimeZone.
+func TestStoreUsesTheTablesSchemaAndUTCDaysInAnySession(t *testing.T) {
+	address := postgresadapter.Postgres.Database(t)
+	setup, err := pgx.Connect(t.Context(), address)
+	require.NoError(t, err)
+	_, err = setup.Exec(t.Context(), "CREATE SCHEMA events; ALTER TABLE govengers_wide_events SET SCHEMA events")
+	require.NoError(t, err)
+	require.NoError(t, setup.Close(t.Context()))
+	config, err := pgxpool.ParseConfig(address)
+	require.NoError(t, err)
+	config.ConnConfig.RuntimeParams["search_path"] = "public, events" // an unqualified CREATE would land in public
+	config.ConnConfig.RuntimeParams["timezone"] = "Europe/Berlin"
+	pool, err := pgxpool.NewWithConfig(t.Context(), config)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	var lines []map[string]any
+	fixture := newFixtureOn(t, pool, &postgresadapter.Options{RetentionDays: 1, Archiver: keepLines(&lines)})
+	emitter := fixture.emitter(t, nil)
+	fixture.clock.Set(testDay.Add(day - time.Second)) // 00:59:59 of the next day in Berlin
+	require.NoError(t, fixture.store.Maintain(t.Context()))
+
+	emitEvent(emitter, "before_midnight", nil)
+	fixture.clock.Set(testDay.Add(day + time.Second))
+	emitEvent(emitter, "after_midnight", nil)
+	require.NoError(t, emitter.Flush(t.Context()))
+
+	rows, err := pool.Query(t.Context(), `
+SELECT e.name, c.relnamespace::regnamespace::text || '.' || c.relname FROM govengers_wide_events e JOIN pg_class c ON c.oid = e.tableoid`)
+	require.NoError(t, err)
+	placed := map[string]string{}
+	for rows.Next() {
+		var name, partition string
+		require.NoError(t, rows.Scan(&name, &partition))
+		placed[name] = partition
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t, map[string]string{
+		"before_midnight": "events." + partitionOf(testDay),
+		"after_midnight":  "events." + partitionOf(testDay.Add(day)),
+	}, placed)
+	var inPublic int
+	require.NoError(t, pool.QueryRow(t.Context(), "SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace").Scan(&inPublic))
+	require.Zero(t, inPublic, "no partition in the first schema of the search_path")
+
+	fixture.clock.Set(testDay.Add(2 * day))
+	require.NoError(t, fixture.store.Maintain(t.Context()))
+
+	require.Len(t, lines, 1)
+	require.Equal(t, "before_midnight", lines[0]["name"])
+	require.Equal(t, "2026-03-14T23:59:59.000000Z", lines[0]["time"])
+	require.Equal(t, []string{"after_midnight"}, storedNames(t, fixture.store))
 }

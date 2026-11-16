@@ -8,12 +8,12 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 
-	"github.com/govengers/wide-event-logger/internal/postgrestest"
 	"github.com/govengers/wide-event-logger/postgresadapter"
 )
 
-func TestMain(m *testing.M) { postgrestest.Main(m) }
+func TestMain(m *testing.M) { goleak.VerifyTestMain(postgresadapter.Postgres.Main(m)) }
 
 // testDay is the day the tests' clocks start on; any day works, a fixed one keeps the test cacheable.
 var testDay = time.Date(2026, time.March, 14, 0, 0, 0, 0, time.UTC)
@@ -125,7 +125,7 @@ func (r *recorder) nextBatch(t *testing.T) postgresadapter.Batch {
 	}
 }
 
-// fixture is a store on a fresh schema with an injected clock and a recorder.
+// fixture is a store on a fresh database with an injected clock and a recorder.
 type fixture struct {
 	pool     *pgxpool.Pool
 	store    *postgresadapter.Store
@@ -135,10 +135,15 @@ type fixture struct {
 
 func newFixture(t *testing.T, options *postgresadapter.Options) *fixture {
 	t.Helper()
+	return newFixtureOn(t, postgresadapter.Postgres.Pool(t), options)
+}
+
+// newFixtureOn is newFixture on a pool the test set up itself.
+func newFixtureOn(t *testing.T, pool *pgxpool.Pool, options *postgresadapter.Options) *fixture {
+	t.Helper()
 	if options == nil {
 		options = &postgresadapter.Options{}
 	}
-	pool := postgrestest.New(t, postgresadapter.MigrationV1)
 	testClock := newClock(testDay.Add(12 * time.Hour))
 	observer := newRecorder()
 	options.Pool, options.Now, options.Observer = pool, testClock.Now, observer

@@ -170,6 +170,8 @@ results and duration. Label values are closed sets and pre-created at zero.
 
 ### W12 Tests share one embedded PostgreSQL per package
 
+The harness part is replaced by W15.
+
 `internal/postgrestest` starts one embedded PostgreSQL 18 per test binary and gives each test a
 fresh schema with `MigrationV1` applied. Concurrency tests run on a pool whose transactions default
 to REPEATABLE READ, and they were checked to fail without the advisory lock and without the READ
@@ -209,6 +211,30 @@ day being archived. The fence never reaches today, which `Maintain` never drops,
 emitter must carry the retention of the Store that runs `Maintain`. With `RetentionDays` zero
 nothing is fenced. Normal events are written within
 seconds and never reach the fence; it costs one comparison per event.
+
+### W15 The tests use govengers/postgrestest
+
+The copied `internal/postgrestest` is gone; `postgresadapter`'s tests use
+`github.com/govengers/postgrestest`, pinned to a pseudo-version of its `main` until it is tagged.
+`export_test.go` holds the package's `postgrestest.Server` (exported there so the internal and the
+external tests share one server; `.govengers.yml` keeps the DES-003 exception for it), and
+`TestMain` wraps its `Main` in `goleak.VerifyTestMain`. Each test gets a database copied from a
+template with `MigrationV1` applied (`CREATE DATABASE ... TEMPLATE`) instead of a schema migrated
+per test, so the tables are in `public` and the session zone is postgrestest's UTC. The old
+harness ran every test in a schema of its own and in the machine's zone, which covered the schema
+lookup of the partitions and the UTC days by accident;
+`TestStoreUsesTheTablesSchemaAndUTCDaysInAnySession` now covers both on purpose: the table in a
+schema behind an empty `public` in the `search_path`, the session in `Europe/Berlin`, a day
+rollover and an archived event. The test that terminates the archiving backend filters
+`pg_stat_activity` on `current_database()`, so it can only hit its own test's connection on a
+shared server.
+
+The shared-server launcher (`cmd/postgrestest`) is not wired into `just test`: `postgresadapter`
+is the only package with PostgreSQL tests, so a run starts one server either way (measured 5.9 s
+through the launcher, 6.0 s without, cold test cache), and the launcher starts that server even
+when every package replays from the test cache (warm `go test -race ./...` 0.13 s without, 4.8 s
+through it). Wire it when a second PostgreSQL package appears. The binaries now live in `~/.embedded-postgres-go/postgrestest`, which CI restores,
+instead of the OS temp directory, which every fresh runner unpacked again.
 
 ### Not done
 
