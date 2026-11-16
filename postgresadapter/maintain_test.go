@@ -349,7 +349,7 @@ func TestMaintainStopsArchivingWhenItsConnectionCloses(t *testing.T) {
 			return err
 		}
 		_, err := fixture.pool.Exec(context.Background(),
-			"SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE query LIKE 'FETCH % FROM archived_day'")
+			"SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'FETCH % FROM archived_day'")
 		if err != nil {
 			return err
 		}

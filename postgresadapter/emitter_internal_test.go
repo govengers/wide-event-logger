@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	wideevent "github.com/govengers/wide-event-logger"
-	"github.com/govengers/wide-event-logger/internal/postgrestest"
 )
 
 func TestClassifyRetriesOnlyTransientFailures(t *testing.T) {
@@ -50,7 +49,8 @@ func TestClassifyRetriesOnlyTransientFailures(t *testing.T) {
 func TestInsertNewSkipsTheStoredEvents(t *testing.T) {
 	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeExec, pgx.QueryExecModeSimpleProtocol} {
 		t.Run(mode.String(), func(t *testing.T) {
-			configuration := postgrestest.New(t, MigrationV1).Config()
+			configuration, err := pgxpool.ParseConfig(Postgres.Database(t))
+			require.NoError(t, err)
 			configuration.ConnConfig.DefaultQueryExecMode = mode
 			pool, err := pgxpool.NewWithConfig(t.Context(), configuration)
 			require.NoError(t, err)
